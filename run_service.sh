@@ -9,13 +9,23 @@ if [[ ! -x ".venv/bin/python" ]]; then
   exit 1
 fi
 
-required_vars=(POLYMARKET_WALLET TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
+required_vars=(TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
 for var_name in "${required_vars[@]}"; do
   if [[ -z "${!var_name:-}" ]]; then
     echo "Error: missing required env var: ${var_name}" >&2
     exit 1
   fi
 done
+
+wallet_args=()
+if [[ -n "${POLYMARKET_WALLETS:-}" ]]; then
+  wallet_args+=(--wallets "$POLYMARKET_WALLETS")
+elif [[ -n "${POLYMARKET_WALLET:-}" ]]; then
+  wallet_args+=(--wallet "$POLYMARKET_WALLET")
+else
+  echo "Error: set POLYMARKET_WALLETS or POLYMARKET_WALLET" >&2
+  exit 1
+fi
 
 POLYMARKET_OUTPUT="${POLYMARKET_OUTPUT:-polymarket_activity.csv}"
 POLYMARKET_LIMIT="${POLYMARKET_LIMIT:-500}"
@@ -36,10 +46,13 @@ fi
 if [[ "${POLYMARKET_NO_ANALYSIS:-0}" == "1" ]]; then
   extra_args+=(--no-analysis)
 fi
+if [[ "${POLYMARKET_NO_TELEGRAM_CONTROL:-0}" == "1" ]]; then
+  extra_args+=(--no-telegram-control)
+fi
 
 exec ".venv/bin/python" "polymarket_activity_to_csv.py" \
   --continuous \
-  --wallet "$POLYMARKET_WALLET" \
+  "${wallet_args[@]}" \
   --output "$POLYMARKET_OUTPUT" \
   --limit "$POLYMARKET_LIMIT" \
   --timeout "$POLYMARKET_TIMEOUT" \

@@ -11,6 +11,7 @@ Usage:
       --market-title "Bitcoin Up or Down - April 7, 6:00PM-6:05PM ET" \
       -o one_market.csv
   python polymarket_activity_to_csv.py --wallet vidarx --continuous -o polymarket_activity.csv
+  python polymarket_activity_to_csv.py --wallets vidarx,trader2 --continuous -o polymarket_activity.csv
   python polymarket_activity_to_csv.py --wallet vidarx --continuous \
       --telegram-bot-token 123456:ABC --telegram-chat-id -1001234567890
 """
@@ -24,6 +25,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -47,6 +49,11 @@ TELEGRAM_DEFAULT_SEND_TIMEOUT_SECONDS = 60
 TELEGRAM_STATE_KEY = "telegram"
 TELEGRAM_SENT_BATCHES_LIMIT = 200
 TELEGRAM_SEND_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
+TELEGRAM_DEFAULT_GET_UPDATES_TIMEOUT_SECONDS = 1
+TELEGRAM_UPDATES_LIMIT = 50
+TARGET_WALLETS_STATE_KEY = "target_wallets"
+WALLET_STATES_STATE_KEY = "wallet_states"
+WALLET_LABELS_STATE_KEY = "wallet_labels"
 CSV_COLUMNS = [
     "datetime_utc",
     "timestamp",
@@ -92,6 +99,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Proxy wallet address (0x...) or a public Polymarket username/pseudonym. "
             "If omitted, you'll be prompted. Environment fallback: POLYMARKET_WALLET."
+        ),
+    )
+    parser.add_argument(
+        "--wallets",
+        default=os.getenv("POLYMARKET_WALLETS"),
+        help=(
+            "Comma-separated wallet addresses/usernames for multi-wallet continuous tracking. "
+            "Example: vidarx,0xabc... Environment fallback: POLYMARKET_WALLETS."
         ),
     )
     parser.add_argument(
@@ -295,6 +310,14 @@ def parse_args() -> argparse.Namespace:
             "By default only new exports are sent."
         ),
     )
+    parser.add_argument(
+        "--no-telegram-control",
+        action="store_true",
+        help=(
+            "Disable Telegram command control (/wallets, /wallet_add, /wallet_remove, /wallet_set). "
+            "By default command control is enabled in continuous mode when Telegram is configured."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -393,6 +416,75 @@ def prompt_for_wallet(identifier: Optional[str]) -> str:
     if not entered:
         raise RuntimeError("Wallet is required.")
     return entered
+
+
+def parse_wallet_identifier_list(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for part in str(raw).split(","):
+        value = part.strip()
+        if not value:
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def collect_requested_wallet_identifiers(args: argparse.Namespace) -> List[str]:
+    wallets = parse_wallet_identifier_list(args.wallets)
+    if args.wallet and args.wallet.strip():
+        wallets.append(args.wallet.strip())
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for identifier in wallets:
+        key = identifier.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(identifier)
+    return deduped
+
+
+def ensure_wallet_identifiers_for_mode(args: argparse.Namespace) -> List[str]:
+    identifiers = collect_requested_wallet_identifiers(args)
+    if args.continuous:
+        return identifiers
+
+    if len(identifiers) > 1:
+        raise RuntimeError("Multiple wallets are supported only with --continuous mode.")
+
+    if identifiers:
+        return identifiers
+    return [prompt_for_wallet(None)]
+
+
+def resolve_wallet_identifiers(
+    session: requests.Session,
+    identifiers: Iterable[str],
+    timeout: int,
+) -> List[Dict[str, str]]:
+    resolved: List[Dict[str, str]] = []
+    seen_wallets: set[str] = set()
+    for identifier in identifiers:
+        wallet = resolve_wallet(session, identifier, timeout).strip()
+        wallet_key = wallet.lower()
+        if wallet_key in seen_wallets:
+            continue
+        seen_wallets.add(wallet_key)
+        resolved.append(
+            {
+                "input": identifier,
+                "wallet": wallet,
+                "label": sanitize_filename_component(identifier, max_len=32),
+            }
+        )
+    return resolved
 
 
 def fetch_activity(
@@ -523,6 +615,25 @@ def output_path_with_market_label(output_path: str, market_titles: Optional[Iter
     tagged_stem = f"{stem} - {market_label}"
     tagged_name = tagged_stem + path.suffix
     return str(path.with_name(tagged_name))
+
+
+def wallet_output_base_path(
+    output_base_path: str,
+    wallet: str,
+    wallet_label: str,
+    multi_wallet_mode: bool,
+) -> str:
+    if not multi_wallet_mode:
+        return output_base_path
+
+    path = Path(output_base_path)
+    short_wallet = wallet.lower()
+    short_wallet = short_wallet[:8] + "_" + short_wallet[-6:] if len(short_wallet) >= 14 else short_wallet
+    label = sanitize_filename_component(wallet_label, max_len=24) if wallet_label else "wallet"
+    folder_name = sanitize_filename_component(f"{label}_{short_wallet}", max_len=48)
+    wallet_dir = path.parent / folder_name
+    wallet_dir.mkdir(parents=True, exist_ok=True)
+    return str(wallet_dir / path.name)
 
 
 def filter_rows_by_market_titles(
@@ -821,6 +932,43 @@ def load_continuous_state(state_path: str) -> Dict[str, Any]:
 
     state = dict(payload)
     state["processed_condition_ids"] = cleaned_ids
+
+    wallet_states = state.get(WALLET_STATES_STATE_KEY)
+    if isinstance(wallet_states, dict):
+        cleaned_wallet_states: Dict[str, Dict[str, Any]] = {}
+        for raw_wallet, raw_entry in wallet_states.items():
+            wallet = normalize_wallet_address(raw_wallet)
+            if not wallet or not isinstance(raw_entry, dict):
+                continue
+            entry = dict(raw_entry)
+            raw_wallet_ids = entry.get("processed_condition_ids")
+            if not isinstance(raw_wallet_ids, list):
+                raw_wallet_ids = []
+            seen_wallet_ids: set[str] = set()
+            cleaned_wallet_ids: List[str] = []
+            for item in raw_wallet_ids:
+                normalized = normalize_condition_id(item)
+                if not normalized or normalized in seen_wallet_ids:
+                    continue
+                seen_wallet_ids.add(normalized)
+                cleaned_wallet_ids.append(normalized)
+            entry["processed_condition_ids"] = cleaned_wallet_ids
+            entry["wallet"] = wallet
+            cleaned_wallet_states[wallet] = entry
+        state[WALLET_STATES_STATE_KEY] = cleaned_wallet_states
+
+    targets = state.get(TARGET_WALLETS_STATE_KEY)
+    if isinstance(targets, list):
+        cleaned_targets: List[str] = []
+        seen_targets: set[str] = set()
+        for item in targets:
+            wallet = normalize_wallet_address(item)
+            if not wallet or wallet in seen_targets:
+                continue
+            seen_targets.add(wallet)
+            cleaned_targets.append(wallet)
+        state[TARGET_WALLETS_STATE_KEY] = cleaned_targets
+
     return state
 
 
@@ -837,6 +985,151 @@ def save_continuous_state(state_path: str, state: Dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8", newline="") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
         fh.write("\n")
+
+
+def normalize_wallet_address(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def ensure_wallet_states_root(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    root = state.get(WALLET_STATES_STATE_KEY)
+    if not isinstance(root, dict):
+        root = {}
+        state[WALLET_STATES_STATE_KEY] = root
+    return root
+
+
+def ensure_wallet_state_entry(state: Dict[str, Any], wallet: str) -> Dict[str, Any]:
+    wallet_key = normalize_wallet_address(wallet)
+    root = ensure_wallet_states_root(state)
+    entry = root.get(wallet_key)
+    if not isinstance(entry, dict):
+        entry = {}
+
+    raw_ids = entry.get("processed_condition_ids")
+    if not isinstance(raw_ids, list):
+        raw_ids = []
+
+    cleaned_ids: List[str] = []
+    seen: set[str] = set()
+    for item in raw_ids:
+        normalized = normalize_condition_id(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned_ids.append(normalized)
+
+    entry["processed_condition_ids"] = cleaned_ids
+    entry.setdefault("wallet", wallet_key)
+    entry.setdefault("added_utc", datetime.now(timezone.utc).isoformat())
+    root[wallet_key] = entry
+    return entry
+
+
+def get_wallet_processed_set(state: Dict[str, Any], wallet: str) -> set[str]:
+    entry = ensure_wallet_state_entry(state, wallet)
+    return {normalize_condition_id(item) for item in entry.get("processed_condition_ids", [])}
+
+
+def mark_wallet_condition_processed(state: Dict[str, Any], wallet: str, condition_id: str) -> None:
+    entry = ensure_wallet_state_entry(state, wallet)
+    normalized = normalize_condition_id(condition_id)
+    if not normalized:
+        return
+    processed = [normalize_condition_id(item) for item in entry.get("processed_condition_ids", [])]
+    if normalized not in processed:
+        processed.append(normalized)
+    entry["processed_condition_ids"] = sorted({item for item in processed if item})
+    entry["updated_utc"] = datetime.now(timezone.utc).isoformat()
+
+
+def get_target_wallets(state: Dict[str, Any]) -> List[str]:
+    raw = state.get(TARGET_WALLETS_STATE_KEY)
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        wallet = normalize_wallet_address(item)
+        if not wallet or wallet in seen:
+            continue
+        seen.add(wallet)
+        out.append(wallet)
+    return out
+
+
+def set_target_wallets(state: Dict[str, Any], wallets: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in wallets:
+        wallet = normalize_wallet_address(item)
+        if not wallet or wallet in seen:
+            continue
+        seen.add(wallet)
+        out.append(wallet)
+        ensure_wallet_state_entry(state, wallet)
+    state[TARGET_WALLETS_STATE_KEY] = out
+    return out
+
+
+def ensure_wallet_labels_root(state: Dict[str, Any]) -> Dict[str, str]:
+    root = state.get(WALLET_LABELS_STATE_KEY)
+    if not isinstance(root, dict):
+        root = {}
+        state[WALLET_LABELS_STATE_KEY] = root
+    cleaned: Dict[str, str] = {}
+    for raw_wallet, raw_label in root.items():
+        wallet = normalize_wallet_address(raw_wallet)
+        if not wallet:
+            continue
+        label = sanitize_filename_component(str(raw_label or ""), max_len=32)
+        cleaned[wallet] = label or wallet
+    state[WALLET_LABELS_STATE_KEY] = cleaned
+    return cleaned
+
+
+def set_wallet_label(state: Dict[str, Any], wallet: str, label: str) -> None:
+    wallet_key = normalize_wallet_address(wallet)
+    if not wallet_key:
+        return
+    labels = ensure_wallet_labels_root(state)
+    cleaned = sanitize_filename_component(label, max_len=32)
+    labels[wallet_key] = cleaned or wallet_key
+
+
+def get_wallet_label(state: Dict[str, Any], wallet: str) -> str:
+    wallet_key = normalize_wallet_address(wallet)
+    if not wallet_key:
+        return "wallet"
+    labels = ensure_wallet_labels_root(state)
+    existing = str(labels.get(wallet_key) or "").strip()
+    if existing:
+        return existing
+    default = wallet_key[:8] + "_" + wallet_key[-6:] if len(wallet_key) >= 14 else wallet_key
+    labels[wallet_key] = default
+    return default
+
+
+def migrate_legacy_processed_ids_if_needed(state: Dict[str, Any], wallet: str) -> None:
+    entry = ensure_wallet_state_entry(state, wallet)
+    current_ids = entry.get("processed_condition_ids")
+    if isinstance(current_ids, list) and current_ids:
+        return
+
+    legacy = state.get("processed_condition_ids")
+    if not isinstance(legacy, list) or not legacy:
+        return
+
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for item in legacy:
+        normalized = normalize_condition_id(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    if cleaned:
+        entry["processed_condition_ids"] = cleaned
 
 
 def resolve_existing_file(path_text: Any) -> Optional[Path]:
@@ -911,13 +1204,20 @@ def build_telegram_batch_zip(
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for idx, export_item in enumerate(exports_batch, start=1):
             title = str(export_item.get("title") or "market").strip()
+            wallet = str(export_item.get("wallet") or "").strip().lower()
+            wallet_label = str(export_item.get("wallet_label") or "").strip()
             safe_title = sanitize_filename_component(title, max_len=55)
-            folder_name = f"{idx:02d}_{safe_title}"
+            safe_wallet = sanitize_filename_component(wallet_label or wallet or "wallet", max_len=24)
+            folder_name = f"{idx:02d}_{safe_wallet}_{safe_title}"
             condition_id = str(export_item.get("condition_id") or "")
             market_id = str(export_item.get("market_id") or "")
 
             manifest_lines.append(
-                f"[{idx}] title={title} | condition_id={condition_id} | market_id={market_id}"
+                (
+                    f"[{idx}] wallet={wallet}"
+                    + (f" ({wallet_label})" if wallet_label else "")
+                    + f" | title={title} | condition_id={condition_id} | market_id={market_id}"
+                )
             )
 
             files = collect_export_report_files(export_item)
@@ -969,6 +1269,78 @@ def send_telegram_document(
     if not isinstance(body, dict) or not body.get("ok"):
         raise RuntimeError(f"Telegram API error: {body}")
     return body
+
+
+def send_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    timeout: int,
+) -> Dict[str, Any]:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text[:4096],
+    }
+    response = requests.post(url, data=payload, timeout=timeout)
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict) or not body.get("ok"):
+        raise RuntimeError(f"Telegram API error: {body}")
+    return body
+
+
+def fetch_telegram_updates(
+    bot_token: str,
+    offset: Optional[int],
+    timeout: int,
+    long_poll_timeout: int = TELEGRAM_DEFAULT_GET_UPDATES_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+    params: Dict[str, Any] = {
+        "timeout": max(0, int(long_poll_timeout)),
+        "limit": TELEGRAM_UPDATES_LIMIT,
+        "allowed_updates": json.dumps(["message"]),
+    }
+    if offset is not None:
+        params["offset"] = int(offset)
+
+    response = requests.get(url, params=params, timeout=max(timeout, 5))
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict) or not body.get("ok"):
+        raise RuntimeError(f"Telegram API error: {body}")
+    return body
+
+
+def telegram_chat_matches(update_chat: Any, configured_chat_id: str) -> bool:
+    if not isinstance(update_chat, dict):
+        return False
+
+    target = str(configured_chat_id or "").strip()
+    if not target:
+        return False
+
+    if target.startswith("@"):
+        username = str(update_chat.get("username") or "").strip()
+        if not username:
+            return False
+        return target[1:].casefold() == username.casefold()
+
+    update_chat_id = str(update_chat.get("id") or "").strip()
+    return target == update_chat_id
+
+
+def parse_telegram_command(text: str) -> tuple[str, str]:
+    raw = str(text or "").strip()
+    if not raw.startswith("/"):
+        return ("", "")
+
+    first, _, rest = raw.partition(" ")
+    command = first[1:]
+    command = command.split("@", 1)[0].strip().casefold()
+    argument = rest.strip()
+    return (command, argument)
 
 
 def ensure_telegram_state(
@@ -1077,6 +1449,14 @@ def flush_telegram_batches(
         telegram_state["last_sent_utc"] = datetime.now(timezone.utc).isoformat()
         telegram_state.pop("last_error", None)
 
+        all_exports = state.get("exports")
+        if isinstance(all_exports, list) and len(all_exports) > 4000:
+            next_idx = int(telegram_state.get("next_export_index") or 0)
+            removable = min(next_idx, len(all_exports) - 2000)
+            if removable > 0:
+                state["exports"] = all_exports[removable:]
+                telegram_state["next_export_index"] = next_idx - removable
+
         state[TELEGRAM_STATE_KEY] = telegram_state
         save_continuous_state(state_path, state)
 
@@ -1089,6 +1469,22 @@ def flush_telegram_batches(
         )
 
         start_index = batch_end
+
+
+def sleep_interruptible(seconds: int, stop_event: Optional[threading.Event]) -> bool:
+    if seconds <= 0:
+        return False
+    if stop_event is None:
+        time.sleep(seconds)
+        return False
+
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if stop_event.is_set():
+            return True
+        remaining = deadline - time.time()
+        time.sleep(min(0.5, max(0.0, remaining)))
+    return bool(stop_event.is_set())
 
 
 def choose_next_active_market(
@@ -1155,6 +1551,7 @@ def collect_market_rows_until_inactive(
     start_ts: Optional[int],
     end_ts: Optional[int],
     max_pages: Optional[int],
+    stop_event: Optional[threading.Event] = None,
 ) -> tuple[List[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
     condition_key = normalize_condition_id(condition_id)
     if not condition_key:
@@ -1173,6 +1570,9 @@ def collect_market_rows_until_inactive(
     latest_market = initial_market
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return (rows_for_market, title, latest_market)
+
         try:
             fetched = fetch_activity(
                 session=session,
@@ -1193,7 +1593,8 @@ def collect_market_rows_until_inactive(
                 f"Warning: activity fetch failed while tracking {title}: {exc}. Retrying in {poll_seconds}s.",
                 file=sys.stderr,
             )
-            time.sleep(poll_seconds)
+            if sleep_interruptible(poll_seconds, stop_event):
+                return (rows_for_market, title, latest_market)
             continue
 
         filtered_rows = filter_rows_by_condition_id(fetched, condition_key)
@@ -1241,7 +1642,8 @@ def collect_market_rows_until_inactive(
             if inactive_since is not None:
                 print(f"{title} became active again; resuming collection.", file=sys.stderr)
             inactive_since = None
-            time.sleep(poll_seconds)
+            if sleep_interruptible(poll_seconds, stop_event):
+                return (rows_for_market, title, latest_market)
             continue
 
         if inactive_since is None:
@@ -1253,12 +1655,14 @@ def collect_market_rows_until_inactive(
                 ),
                 file=sys.stderr,
             )
-            time.sleep(poll_seconds)
+            if sleep_interruptible(poll_seconds, stop_event):
+                return (rows_for_market, title, latest_market)
             continue
 
         elapsed = time.time() - inactive_since
         if elapsed < finalize_grace_seconds:
-            time.sleep(poll_seconds)
+            if sleep_interruptible(poll_seconds, stop_event):
+                return (rows_for_market, title, latest_market)
             continue
 
         try:
@@ -1288,9 +1692,399 @@ def collect_market_rows_until_inactive(
         return (rows_for_market, title, latest_market)
 
 
+class CompositeStopEvent:
+    def __init__(self, *events: threading.Event) -> None:
+        self.events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self.events)
+
+
+def wallet_display_name(wallet: str, label: str) -> str:
+    if label:
+        return f"{label} ({wallet})"
+    return wallet
+
+
+def format_tracked_wallets_message(state: Dict[str, Any]) -> str:
+    targets = get_target_wallets(state)
+    if not targets:
+        return "Tracked wallets: none"
+
+    lines = ["Tracked wallets:"]
+    for idx, wallet in enumerate(targets, start=1):
+        label = get_wallet_label(state, wallet)
+        entry = ensure_wallet_state_entry(state, wallet)
+        processed_count = len(entry.get("processed_condition_ids") or [])
+        lines.append(f"{idx}) {label}: {wallet} (processed {processed_count})")
+    return "\n".join(lines)
+
+
+def resolve_wallet_for_remove_argument(
+    session: requests.Session,
+    state: Dict[str, Any],
+    argument: str,
+    timeout: int,
+) -> Optional[str]:
+    raw = str(argument or "").strip()
+    if not raw:
+        return None
+
+    targets = get_target_wallets(state)
+    lowered = raw.casefold()
+
+    if is_wallet(raw):
+        wallet = normalize_wallet_address(raw)
+        if wallet in targets:
+            return wallet
+
+    labels = ensure_wallet_labels_root(state)
+    by_label = [wallet for wallet in targets if str(labels.get(wallet, "")).casefold() == lowered]
+    if len(by_label) == 1:
+        return by_label[0]
+
+    by_prefix = [wallet for wallet in targets if wallet.startswith(lowered)]
+    if len(by_prefix) == 1:
+        return by_prefix[0]
+
+    try:
+        resolved = resolve_wallet(session, raw, timeout)
+    except Exception:
+        return None
+    resolved_key = normalize_wallet_address(resolved)
+    return resolved_key if resolved_key in targets else None
+
+
+def apply_wallet_control_command(
+    session: requests.Session,
+    state: Dict[str, Any],
+    state_path: str,
+    command: str,
+    argument: str,
+    timeout: int,
+) -> tuple[bool, Optional[str]]:
+    cmd = command.casefold()
+
+    if cmd in {"start", "help", "wallet_help"}:
+        return (
+            False,
+            "Commands:\n"
+            "/wallets - show tracked wallets\n"
+            "/wallet_add <wallet_or_username> - add wallet\n"
+            "/wallet_remove <wallet_or_username> - remove wallet\n"
+            "/wallet_set <w1,w2,w3> - replace wallet list",
+        )
+
+    if cmd in {"wallets", "wallet_list"}:
+        return (False, format_tracked_wallets_message(state))
+
+    if cmd == "wallet_add":
+        if not argument:
+            return (False, "Usage: /wallet_add <wallet_or_username>")
+        resolved_wallet = resolve_wallet(session, argument, timeout)
+        wallet_key = normalize_wallet_address(resolved_wallet)
+        targets = get_target_wallets(state)
+        if wallet_key in targets:
+            return (False, f"Already tracking: {wallet_key}")
+        targets.append(wallet_key)
+        set_target_wallets(state, targets)
+        set_wallet_label(state, wallet_key, argument)
+        save_continuous_state(state_path, state)
+        return (True, f"Added wallet: {wallet_key}")
+
+    if cmd == "wallet_remove":
+        if not argument:
+            return (False, "Usage: /wallet_remove <wallet_or_username>")
+        wallet_key = resolve_wallet_for_remove_argument(session, state, argument, timeout)
+        if not wallet_key:
+            return (False, f"Wallet not found in target list: {argument}")
+        targets = [wallet for wallet in get_target_wallets(state) if wallet != wallet_key]
+        set_target_wallets(state, targets)
+        save_continuous_state(state_path, state)
+        return (True, f"Removed wallet: {wallet_key}")
+
+    if cmd == "wallet_set":
+        identifiers = parse_wallet_identifier_list(argument)
+        if not identifiers:
+            return (False, "Usage: /wallet_set <wallet1,wallet2,...>")
+
+        resolved_pairs: List[tuple[str, str]] = []
+        for identifier in identifiers:
+            resolved_wallet = resolve_wallet(session, identifier, timeout)
+            resolved_pairs.append((identifier, normalize_wallet_address(resolved_wallet)))
+
+        for identifier, wallet in resolved_pairs:
+            set_wallet_label(state, wallet, identifier)
+        targets = set_target_wallets(state, [wallet for _, wallet in resolved_pairs])
+        save_continuous_state(state_path, state)
+        return (True, f"Updated target wallets ({len(targets)}).")
+
+    return (False, None)
+
+
+def poll_telegram_control_commands(
+    session: requests.Session,
+    state: Dict[str, Any],
+    state_path: str,
+    bot_token: str,
+    chat_id: str,
+    timeout: int,
+) -> bool:
+    telegram_state = state.get(TELEGRAM_STATE_KEY)
+    if not isinstance(telegram_state, dict):
+        telegram_state = {}
+
+    raw_offset = telegram_state.get("updates_offset")
+    offset = int(raw_offset) if isinstance(raw_offset, int) else None
+    payload = fetch_telegram_updates(
+        bot_token=bot_token,
+        offset=offset,
+        timeout=timeout,
+        long_poll_timeout=TELEGRAM_DEFAULT_GET_UPDATES_TIMEOUT_SECONDS,
+    )
+    updates = payload.get("result")
+    if not isinstance(updates, list) or not updates:
+        return False
+
+    changed = False
+    next_offset = offset if offset is not None else 0
+
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            next_offset = max(next_offset, update_id + 1)
+
+        message = update.get("message")
+        if not isinstance(message, dict):
+            continue
+
+        if not telegram_chat_matches(message.get("chat"), chat_id):
+            continue
+
+        text = str(message.get("text") or "")
+        command, argument = parse_telegram_command(text)
+        if not command:
+            continue
+
+        try:
+            was_changed, response_text = apply_wallet_control_command(
+                session=session,
+                state=state,
+                state_path=state_path,
+                command=command,
+                argument=argument,
+                timeout=timeout,
+            )
+            if was_changed:
+                changed = True
+            if response_text:
+                send_telegram_message(
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    text=response_text,
+                    timeout=max(5, timeout),
+                )
+        except Exception as exc:
+            error_text = f"Command failed: {exc}"
+            print(f"Warning: {error_text}", file=sys.stderr)
+            try:
+                send_telegram_message(
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    text=error_text,
+                    timeout=max(5, timeout),
+                )
+            except Exception:
+                pass
+
+    telegram_state["updates_offset"] = next_offset
+    state[TELEGRAM_STATE_KEY] = telegram_state
+    save_continuous_state(state_path, state)
+    return changed
+
+
+def wallet_worker_loop(
+    wallet: str,
+    wallet_label: str,
+    output_base_path: str,
+    multi_wallet_mode: bool,
+    timeout: int,
+    page_limit: int,
+    poll_seconds: int,
+    finalize_grace_seconds: int,
+    discovery_pages: int,
+    analysis_enabled: bool,
+    scenario_min_bets: List[float],
+    scenario_max_bets: List[float],
+    scenario_max_prices: List[float],
+    scenario_auto_min_bets: bool,
+    scenario_auto_max_bets: bool,
+    scenario_auto_max_prices: bool,
+    start_ts: Optional[int],
+    end_ts: Optional[int],
+    max_pages: Optional[int],
+    state: Dict[str, Any],
+    state_lock: threading.Lock,
+    state_path: str,
+    telegram_enabled: bool,
+    telegram_bot_token: Optional[str],
+    telegram_chat_id: Optional[str],
+    telegram_batch_size: int,
+    global_stop_event: threading.Event,
+    wallet_stop_event: threading.Event,
+    run_counter: Dict[str, int],
+    max_markets: Optional[int],
+) -> None:
+    display = wallet_display_name(wallet, wallet_label)
+    stop_signal = CompositeStopEvent(global_stop_event, wallet_stop_event)
+    worker_session = session_with_headers()
+
+    while not stop_signal.is_set():
+        if max_markets is not None:
+            with state_lock:
+                if int(run_counter.get("exported", 0)) >= max_markets:
+                    global_stop_event.set()
+                    break
+
+        with state_lock:
+            processed_set = get_wallet_processed_set(state, wallet)
+
+        try:
+            candidate = choose_next_active_market(
+                session=worker_session,
+                wallet=wallet,
+                timeout=timeout,
+                page_limit=page_limit,
+                discovery_pages=discovery_pages,
+                processed_condition_ids=processed_set,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        except requests.RequestException as exc:
+            print(f"[{display}] discovery failed: {exc}", file=sys.stderr)
+            if sleep_interruptible(poll_seconds, stop_signal):
+                break
+            continue
+
+        if candidate is None:
+            if sleep_interruptible(poll_seconds, stop_signal):
+                break
+            continue
+
+        condition_id = normalize_condition_id(candidate.get("condition_id"))
+        if not condition_id:
+            if sleep_interruptible(poll_seconds, stop_signal):
+                break
+            continue
+
+        market_title = str(candidate.get("title") or "").strip() or "(untitled market)"
+        print(
+            f"[{display}] tracking market: {market_title} (conditionId {condition_id})",
+            file=sys.stderr,
+        )
+
+        rows, final_title, final_market = collect_market_rows_until_inactive(
+            session=worker_session,
+            wallet=wallet,
+            condition_id=condition_id,
+            initial_market=candidate.get("market") if isinstance(candidate.get("market"), dict) else None,
+            initial_title=market_title,
+            timeout=timeout,
+            page_limit=page_limit,
+            poll_seconds=poll_seconds,
+            finalize_grace_seconds=finalize_grace_seconds,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            max_pages=max_pages,
+            stop_event=stop_signal,
+        )
+
+        if stop_signal.is_set():
+            break
+
+        selected_titles = [final_title]
+        wallet_base = wallet_output_base_path(
+            output_base_path=output_base_path,
+            wallet=wallet,
+            wallet_label=wallet_label,
+            multi_wallet_mode=multi_wallet_mode,
+        )
+        output_path = output_path_with_market_label(wallet_base, selected_titles)
+        count = write_csv(rows, output_path)
+
+        analysis_result: Optional[Dict[str, Any]] = None
+        if analysis_enabled:
+            analysis_result = generate_analysis_files(
+                rows=rows,
+                wallet=wallet,
+                selected_market_titles=selected_titles,
+                output_csv_path=output_path,
+                scenario_min_bets=scenario_min_bets,
+                scenario_max_bets=scenario_max_bets,
+                scenario_max_prices=scenario_max_prices,
+                scenario_auto_min_bets=scenario_auto_min_bets,
+                scenario_auto_max_bets=scenario_auto_max_bets,
+                scenario_auto_max_prices=scenario_auto_max_prices,
+            )
+
+        with state_lock:
+            mark_wallet_condition_processed(state, wallet, condition_id)
+            state["processed_condition_ids"] = sorted(get_wallet_processed_set(state, wallet))
+
+            exports = state.get("exports")
+            if not isinstance(exports, list):
+                exports = []
+
+            export_record = {
+                "wallet": wallet,
+                "wallet_label": wallet_label,
+                "condition_id": condition_id,
+                "market_id": str(final_market.get("id") or "") if isinstance(final_market, dict) else "",
+                "title": final_title,
+                "csv_path": output_path,
+                "analysis_path": analysis_result["analysis_path"] if analysis_result is not None else "",
+                "scenarios_path": analysis_result["scenarios_path"] if analysis_result is not None else "",
+                "exported_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            exports.append(export_record)
+            state["exports"] = exports
+
+            wallet_entry = ensure_wallet_state_entry(state, wallet)
+            wallet_entry["last_export_utc"] = datetime.now(timezone.utc).isoformat()
+            wallet_entry["last_export_title"] = final_title
+            wallet_entry["export_count"] = int(wallet_entry.get("export_count") or 0) + 1
+
+            save_continuous_state(state_path, state)
+
+            if telegram_enabled and telegram_bot_token and telegram_chat_id:
+                flush_telegram_batches(
+                    state=state,
+                    state_path=state_path,
+                    bot_token=telegram_bot_token,
+                    chat_id=telegram_chat_id,
+                    batch_size=telegram_batch_size,
+                    timeout=max(timeout, TELEGRAM_DEFAULT_SEND_TIMEOUT_SECONDS),
+                )
+
+            run_counter["exported"] = int(run_counter.get("exported", 0)) + 1
+            exported_total = run_counter["exported"]
+
+        print(f"[{display}] wrote {count} rows to {output_path}")
+        if analysis_result is not None:
+            print(f"[{display}] wrote analysis report to {analysis_result['analysis_path']}")
+            print(f"[{display}] wrote scenario table to {analysis_result['scenarios_path']}")
+
+        if max_markets is not None and exported_total >= max_markets:
+            global_stop_event.set()
+            break
+
+
 def run_continuous_collection(
     session: requests.Session,
-    wallet: str,
+    resolved_wallets: List[Dict[str, str]],
     output_base_path: str,
     timeout: int,
     page_limit: int,
@@ -1313,32 +2107,68 @@ def run_continuous_collection(
     telegram_chat_id: Optional[str],
     telegram_batch_size: int,
     telegram_send_existing: bool,
+    telegram_control_enabled: bool,
 ) -> int:
     state = load_continuous_state(state_path)
-    raw_ids = state.get("processed_condition_ids")
-    if not isinstance(raw_ids, list):
-        raw_ids = []
-    processed_ids = [normalize_condition_id(item) for item in raw_ids if normalize_condition_id(item)]
-    processed_set = set(processed_ids)
     telegram_enabled = bool(telegram_bot_token and telegram_chat_id)
 
-    if telegram_enabled:
-        ensure_telegram_state(
-            state,
-            batch_size=telegram_batch_size,
-            send_existing=telegram_send_existing,
-        )
+    state_lock = threading.Lock()
+    global_stop_event = threading.Event()
+    run_counter: Dict[str, int] = {"exported": 0}
+
+    initial_wallets: List[str] = []
+    for wallet_entry in resolved_wallets:
+        wallet = normalize_wallet_address(wallet_entry.get("wallet"))
+        if not wallet:
+            continue
+        initial_wallets.append(wallet)
+
+    with state_lock:
+        for wallet_entry in resolved_wallets:
+            wallet = normalize_wallet_address(wallet_entry.get("wallet"))
+            if not wallet:
+                continue
+            ensure_wallet_state_entry(state, wallet)
+            label = str(wallet_entry.get("label") or wallet_entry.get("input") or wallet)
+            set_wallet_label(state, wallet, label)
+
+        existing_targets = get_target_wallets(state)
+        merged_targets = list(existing_targets)
+        seen_targets = set(existing_targets)
+        for wallet in initial_wallets:
+            if wallet in seen_targets:
+                continue
+            seen_targets.add(wallet)
+            merged_targets.append(wallet)
+        targets = set_target_wallets(state, merged_targets)
+
+        if not targets:
+            raise RuntimeError(
+                "No target wallets configured. Provide --wallet/--wallets or add wallets via Telegram commands."
+            )
+
+        if len(targets) == 1:
+            migrate_legacy_processed_ids_if_needed(state, targets[0])
+
+        if telegram_enabled:
+            ensure_telegram_state(
+                state,
+                batch_size=telegram_batch_size,
+                send_existing=telegram_send_existing,
+            )
+
         save_continuous_state(state_path, state)
 
     print(
         (
             "Continuous mode started. "
-            f"Processed markets in state: {len(processed_set)}. "
+            f"Target wallets: {len(get_target_wallets(state))}. "
             f"Polling every {poll_seconds}s."
         ),
         file=sys.stderr,
     )
     print(f"Continuous state file: {state_path}", file=sys.stderr)
+
     if telegram_enabled:
         print(
             (
@@ -1349,145 +2179,140 @@ def run_continuous_collection(
         )
         if telegram_send_existing:
             print("Telegram backlog mode: enabled (will send existing unsent exports).", file=sys.stderr)
-
-        flush_telegram_batches(
-            state=state,
-            state_path=state_path,
-            bot_token=str(telegram_bot_token),
-            chat_id=str(telegram_chat_id),
-            batch_size=telegram_batch_size,
-            timeout=max(timeout, TELEGRAM_DEFAULT_SEND_TIMEOUT_SECONDS),
-        )
+        if telegram_control_enabled:
+            print("Telegram control enabled: /wallets, /wallet_add, /wallet_remove, /wallet_set", file=sys.stderr)
     else:
         print("Telegram delivery disabled (missing token/chat id).", file=sys.stderr)
 
-    exported_in_run = 0
+    with state_lock:
+        if telegram_enabled and telegram_bot_token and telegram_chat_id:
+            flush_telegram_batches(
+                state=state,
+                state_path=state_path,
+                bot_token=telegram_bot_token,
+                chat_id=telegram_chat_id,
+                batch_size=telegram_batch_size,
+                timeout=max(timeout, TELEGRAM_DEFAULT_SEND_TIMEOUT_SECONDS),
+            )
+
+    workers: Dict[str, Dict[str, Any]] = {}
+
+    def start_worker_if_needed(wallet: str) -> None:
+        if wallet in workers:
+            return
+        with state_lock:
+            label = get_wallet_label(state, wallet)
+
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=wallet_worker_loop,
+            kwargs={
+                "wallet": wallet,
+                "wallet_label": label,
+                "output_base_path": output_base_path,
+                "multi_wallet_mode": len(get_target_wallets(state)) > 1,
+                "timeout": timeout,
+                "page_limit": page_limit,
+                "poll_seconds": poll_seconds,
+                "finalize_grace_seconds": finalize_grace_seconds,
+                "discovery_pages": discovery_pages,
+                "analysis_enabled": analysis_enabled,
+                "scenario_min_bets": scenario_min_bets,
+                "scenario_max_bets": scenario_max_bets,
+                "scenario_max_prices": scenario_max_prices,
+                "scenario_auto_min_bets": scenario_auto_min_bets,
+                "scenario_auto_max_bets": scenario_auto_max_bets,
+                "scenario_auto_max_prices": scenario_auto_max_prices,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "max_pages": max_pages,
+                "state": state,
+                "state_lock": state_lock,
+                "state_path": state_path,
+                "telegram_enabled": telegram_enabled,
+                "telegram_bot_token": telegram_bot_token,
+                "telegram_chat_id": telegram_chat_id,
+                "telegram_batch_size": telegram_batch_size,
+                "global_stop_event": global_stop_event,
+                "wallet_stop_event": stop_event,
+                "run_counter": run_counter,
+                "max_markets": max_markets,
+            },
+            daemon=True,
+            name=f"wallet-worker-{wallet[:12]}",
+        )
+        workers[wallet] = {"thread": thread, "stop_event": stop_event}
+        thread.start()
+        print(f"Started worker for {wallet_display_name(wallet, label)}", file=sys.stderr)
+
+    def stop_worker(wallet: str) -> None:
+        runtime = workers.pop(wallet, None)
+        if not runtime:
+            return
+        stop_event = runtime.get("stop_event")
+        thread = runtime.get("thread")
+        if isinstance(stop_event, threading.Event):
+            stop_event.set()
+        if isinstance(thread, threading.Thread):
+            thread.join(timeout=max(2, poll_seconds + 1))
+        print(f"Stopped worker for {wallet}", file=sys.stderr)
+
     try:
-        while True:
-            if max_markets is not None and exported_in_run >= max_markets:
-                print(
-                    f"Reached --continuous-max-markets={max_markets}. Stopping.",
-                    file=sys.stderr,
-                )
-                return 0
+        while not global_stop_event.is_set():
+            with state_lock:
+                target_wallets = get_target_wallets(state)
 
-            try:
-                candidate = choose_next_active_market(
-                    session=session,
-                    wallet=wallet,
-                    timeout=timeout,
-                    page_limit=page_limit,
-                    discovery_pages=discovery_pages,
-                    processed_condition_ids=processed_set,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                )
-            except requests.RequestException as exc:
-                print(
-                    f"Warning: failed to discover next active market: {exc}. Retrying in {poll_seconds}s.",
-                    file=sys.stderr,
-                )
-                time.sleep(poll_seconds)
-                continue
+            for wallet in target_wallets:
+                start_worker_if_needed(wallet)
 
-            if candidate is None:
-                print(
-                    (
-                        "No unprocessed active market found in recent wallet activity. "
-                        f"Retrying in {poll_seconds}s."
-                    ),
-                    file=sys.stderr,
-                )
-                time.sleep(poll_seconds)
-                continue
+            worker_wallets = list(workers.keys())
+            for wallet in worker_wallets:
+                if wallet not in target_wallets:
+                    stop_worker(wallet)
 
-            condition_id = normalize_condition_id(candidate.get("condition_id"))
-            if not condition_id:
-                time.sleep(poll_seconds)
-                continue
+            if telegram_enabled and telegram_control_enabled and telegram_bot_token and telegram_chat_id:
+                try:
+                    with state_lock:
+                        poll_telegram_control_commands(
+                            session=session,
+                            state=state,
+                            state_path=state_path,
+                            bot_token=telegram_bot_token,
+                            chat_id=telegram_chat_id,
+                            timeout=max(timeout, 5),
+                        )
+                except requests.RequestException as exc:
+                    print(f"Warning: telegram control polling failed: {exc}", file=sys.stderr)
+                except Exception as exc:
+                    print(f"Warning: telegram control error: {exc}", file=sys.stderr)
 
-            market_title = str(candidate.get("title") or "").strip() or "(untitled market)"
-            print(
-                (
-                    f"Tracking next active market: {market_title} "
-                    f"(conditionId {condition_id})"
-                ),
-                file=sys.stderr,
-            )
+            if max_markets is not None:
+                with state_lock:
+                    if int(run_counter.get("exported", 0)) >= max_markets:
+                        print(
+                            f"Reached --continuous-max-markets={max_markets}. Stopping.",
+                            file=sys.stderr,
+                        )
+                        global_stop_event.set()
+                        break
 
-            rows, final_title, final_market = collect_market_rows_until_inactive(
-                session=session,
-                wallet=wallet,
-                condition_id=condition_id,
-                initial_market=candidate.get("market") if isinstance(candidate.get("market"), dict) else None,
-                initial_title=market_title,
-                timeout=timeout,
-                page_limit=page_limit,
-                poll_seconds=poll_seconds,
-                finalize_grace_seconds=finalize_grace_seconds,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                max_pages=max_pages,
-            )
+            sleep_interruptible(max(1, min(5, poll_seconds)), global_stop_event)
 
-            selected_titles = [final_title]
-            output_path = output_path_with_market_label(output_base_path, selected_titles)
-            count = write_csv(rows, output_path)
-
-            analysis_result: Optional[Dict[str, Any]] = None
-            if analysis_enabled:
-                analysis_result = generate_analysis_files(
-                    rows=rows,
-                    wallet=wallet,
-                    selected_market_titles=selected_titles,
-                    output_csv_path=output_path,
-                    scenario_min_bets=scenario_min_bets,
-                    scenario_max_bets=scenario_max_bets,
-                    scenario_max_prices=scenario_max_prices,
-                    scenario_auto_min_bets=scenario_auto_min_bets,
-                    scenario_auto_max_bets=scenario_auto_max_bets,
-                    scenario_auto_max_prices=scenario_auto_max_prices,
-                )
-
-            print(f"Wrote {count} rows to {output_path}")
-            if analysis_result is not None:
-                print(f"Wrote analysis report to {analysis_result['analysis_path']}")
-                print(f"Wrote scenario table to {analysis_result['scenarios_path']}")
-
-            processed_set.add(condition_id)
-            state["processed_condition_ids"] = sorted(processed_set)
-
-            exports = state.get("exports")
-            if not isinstance(exports, list):
-                exports = []
-            exports.append(
-                {
-                    "condition_id": condition_id,
-                    "market_id": str(final_market.get("id") or "") if isinstance(final_market, dict) else "",
-                    "title": final_title,
-                    "csv_path": output_path,
-                    "analysis_path": analysis_result["analysis_path"] if analysis_result is not None else "",
-                    "scenarios_path": analysis_result["scenarios_path"] if analysis_result is not None else "",
-                    "exported_utc": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            state["exports"] = exports
-            save_continuous_state(state_path, state)
-
-            if telegram_enabled:
-                flush_telegram_batches(
-                    state=state,
-                    state_path=state_path,
-                    bot_token=str(telegram_bot_token),
-                    chat_id=str(telegram_chat_id),
-                    batch_size=telegram_batch_size,
-                    timeout=max(timeout, TELEGRAM_DEFAULT_SEND_TIMEOUT_SECONDS),
-                )
-
-            exported_in_run += 1
     except KeyboardInterrupt:
         print("Continuous mode interrupted by user.", file=sys.stderr)
-        return 0
+        global_stop_event.set()
+    finally:
+        for runtime in workers.values():
+            stop_event = runtime.get("stop_event")
+            if isinstance(stop_event, threading.Event):
+                stop_event.set()
+
+        for runtime in workers.values():
+            thread = runtime.get("thread")
+            if isinstance(thread, threading.Thread):
+                thread.join(timeout=max(2, poll_seconds + 1))
+
+    return 0
 
 
 def unix_to_iso(ts: Any) -> str:
@@ -2781,6 +3606,11 @@ def main() -> int:
                 "Warning: --telegram-send-existing is ignored (Telegram is not configured).",
                 file=sys.stderr,
             )
+        if args.no_telegram_control and not telegram_enabled:
+            print(
+                "Warning: --no-telegram-control has no effect because Telegram is not configured.",
+                file=sys.stderr,
+            )
     else:
         if telegram_enabled:
             print(
@@ -2792,9 +3622,14 @@ def main() -> int:
                 "Warning: --telegram-send-existing applies only in --continuous mode and will be ignored.",
                 file=sys.stderr,
             )
+        if args.no_telegram_control:
+            print(
+                "Warning: --no-telegram-control applies only in --continuous mode and will be ignored.",
+                file=sys.stderr,
+            )
 
     try:
-        wallet_input = prompt_for_wallet(args.wallet)
+        wallet_identifiers = ensure_wallet_identifiers_for_mode(args)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -2806,13 +3641,30 @@ def main() -> int:
     analysis_result: Optional[Dict[str, Any]] = None
 
     try:
-        wallet = resolve_wallet(session, wallet_input, args.timeout)
-        print(f"Resolved wallet: {wallet}", file=sys.stderr)
+        resolved_wallet_entries: List[Dict[str, str]] = []
+        if wallet_identifiers:
+            resolved_wallet_entries = resolve_wallet_identifiers(
+                session=session,
+                identifiers=wallet_identifiers,
+                timeout=args.timeout,
+            )
+
+        if not args.continuous and not resolved_wallet_entries:
+            raise RuntimeError("No wallets resolved.")
+
+        if len(resolved_wallet_entries) == 1:
+            print(f"Resolved wallet: {resolved_wallet_entries[0]['wallet']}", file=sys.stderr)
+        elif len(resolved_wallet_entries) > 1:
+            print(f"Resolved wallets ({len(resolved_wallet_entries)}):", file=sys.stderr)
+            for item in resolved_wallet_entries:
+                print(f"  - {item['input']} -> {item['wallet']}", file=sys.stderr)
+        elif args.continuous:
+            print("No wallets passed via CLI/env; will use wallets from state/Telegram commands.", file=sys.stderr)
 
         if args.continuous:
             return run_continuous_collection(
                 session=session,
-                wallet=wallet,
+                resolved_wallets=resolved_wallet_entries,
                 output_base_path=args.output,
                 timeout=args.timeout,
                 page_limit=args.limit,
@@ -2835,7 +3687,10 @@ def main() -> int:
                 telegram_chat_id=telegram_chat_id if telegram_enabled else None,
                 telegram_batch_size=args.telegram_batch_size,
                 telegram_send_existing=args.telegram_send_existing,
+                telegram_control_enabled=(telegram_enabled and not args.no_telegram_control),
             )
+
+        wallet = resolved_wallet_entries[0]["wallet"]
 
         if not selected_market_titles and not args.no_interactive and sys.stdin.isatty():
             preview_rows = fetch_activity(
