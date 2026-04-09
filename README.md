@@ -5,6 +5,7 @@ This scraper can run continuously, export one report per market, and send Telegr
 It supports:
 
 - Multiple wallets in parallel (`POLYMARKET_WALLETS="wallet1,wallet2,wallet3"`)
+- Per-wallet market filters (for example `bitcoin`, `ethereum`, `xrp`)
 - Telegram command control to update targets at runtime
 
 ## Quick run (foreground)
@@ -52,24 +53,38 @@ After install:
 - `POLYMARKET_TELEGRAM_SEND_EXISTING=1` to send old unsent exports from state on startup
 - `POLYMARKET_NO_TELEGRAM_CONTROL=1` to disable Telegram wallet management commands
 - `POLYMARKET_NO_ANALYSIS=1` to skip analysis/scenario files
+- `POLYMARKET_WALLET_MARKET_FILTERS="vidarx=bitcoin,ethereum;trader2=xrp"` for startup per-wallet filters
 
 ## Telegram wallet control commands
 
 The bot sends a reply-keyboard with buttons:
 
 - `Wallets`
+- `Select Wallet`
 - `Add Wallet`
 - `Remove Wallet`
 - `Set Wallets`
+- `Add Filter`
+- `Remove Filter`
 - `Help`
 - `Cancel`
+
+Filter workflow:
+
+- Press `Select Wallet`
+- Choose the tracked wallet nickname/address
+- Press `Add Filter` or `Remove Filter`
+- Send one or more comma-separated market keywords (for example `bitcoin,ethereum`)
 
 You can still send commands manually:
 
 - `/wallets` - list tracked wallets
+- `/wallet_select <wallet_or_nickname>` - select tracked wallet for filter actions
 - `/wallet_add <wallet_or_username>` - add a target wallet
 - `/wallet_remove <wallet_or_username>` - remove wallet from tracking
 - `/wallet_set <w1,w2,w3>` - replace the full wallet list
+- `/wallet_filter_add <bitcoin,ethereum>` - add market filters to the selected wallet
+- `/wallet_filter_remove <bitcoin>` - remove market filters from the selected wallet
 - `/wallet_help` - show command help
 - `/cancel` - cancel pending button action
 

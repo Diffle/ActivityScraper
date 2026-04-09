@@ -52,15 +52,20 @@ TELEGRAM_SEND_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 TELEGRAM_DEFAULT_GET_UPDATES_TIMEOUT_SECONDS = 1
 TELEGRAM_UPDATES_LIMIT = 50
 TELEGRAM_PENDING_ACTION_KEY = "pending_action"
+TELEGRAM_SELECTED_WALLETS_KEY = "selected_wallets"
 TELEGRAM_BUTTON_WALLETS = "Wallets"
+TELEGRAM_BUTTON_SELECT = "Select Wallet"
 TELEGRAM_BUTTON_ADD = "Add Wallet"
 TELEGRAM_BUTTON_REMOVE = "Remove Wallet"
 TELEGRAM_BUTTON_SET = "Set Wallets"
+TELEGRAM_BUTTON_ADD_FILTER = "Add Filter"
+TELEGRAM_BUTTON_REMOVE_FILTER = "Remove Filter"
 TELEGRAM_BUTTON_HELP = "Help"
 TELEGRAM_BUTTON_CANCEL = "Cancel"
 TARGET_WALLETS_STATE_KEY = "target_wallets"
 WALLET_STATES_STATE_KEY = "wallet_states"
 WALLET_LABELS_STATE_KEY = "wallet_labels"
+WALLET_MARKET_FILTERS_KEY = "market_filters"
 CSV_COLUMNS = [
     "datetime_utc",
     "timestamp",
@@ -114,6 +119,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Comma-separated wallet addresses/usernames for multi-wallet continuous tracking. "
             "Example: vidarx,0xabc... Environment fallback: POLYMARKET_WALLETS."
+        ),
+    )
+    parser.add_argument(
+        "--wallet-market-filter",
+        action="append",
+        default=None,
+        help=(
+            "Per-wallet market filter for continuous mode in the form "
+            "wallet_or_username=bitcoin,ethereum. Repeat per wallet. "
+            "Environment fallback: POLYMARKET_WALLET_MARKET_FILTERS using ';' between rules."
         ),
     )
     parser.add_argument(
@@ -321,7 +336,8 @@ def parse_args() -> argparse.Namespace:
         "--no-telegram-control",
         action="store_true",
         help=(
-            "Disable Telegram command control (/wallets, /wallet_add, /wallet_remove, /wallet_set). "
+            "Disable Telegram command control (/wallets, /wallet_select, /wallet_add, /wallet_remove, "
+            "/wallet_set, /wallet_filter_add, /wallet_filter_remove). "
             "By default command control is enabled in continuous mode when Telegram is configured."
         ),
     )
@@ -571,6 +587,13 @@ def normalize_for_match(value: Optional[str]) -> str:
     return " ".join(text.split()).strip().casefold()
 
 
+def short_wallet_display(wallet: str) -> str:
+    wallet_key = normalize_wallet_address(wallet)
+    if len(wallet_key) >= 14:
+        return wallet_key[:8] + "_" + wallet_key[-6:]
+    return wallet_key or "wallet"
+
+
 def sanitize_filename_component(value: str, max_len: int = MARKET_FILENAME_MAX_LEN) -> str:
     cleaned = " ".join(str(value or "").split()).strip()
     if not cleaned:
@@ -601,6 +624,91 @@ def clean_market_titles(market_titles: Optional[Iterable[str]]) -> List[str]:
         seen.add(key)
         cleaned.append(raw)
     return cleaned
+
+
+def clean_market_filters(filters: Optional[Iterable[str]]) -> List[str]:
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for item in filters or []:
+        raw = " ".join(str(item or "").split()).strip()
+        if not raw:
+            continue
+        key = normalize_for_match(raw)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(raw)
+    return cleaned
+
+
+def parse_market_filter_text(raw: Optional[str]) -> List[str]:
+    if raw is None:
+        return []
+    return clean_market_filters(str(raw).split(","))
+
+
+def format_market_filters(filters: Optional[Iterable[str]]) -> str:
+    cleaned = clean_market_filters(filters)
+    return ", ".join(cleaned) if cleaned else "all markets"
+
+
+def market_title_matches_filters(title: str, filters: Optional[Iterable[str]]) -> bool:
+    cleaned = clean_market_filters(filters)
+    if not cleaned:
+        return True
+
+    title_key = normalize_for_match(title)
+    return any(normalize_for_match(item) in title_key for item in cleaned)
+
+
+def split_wallet_market_filter_specs(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    out: List[str] = []
+    for part in re.split(r"[;\r\n]+", str(raw)):
+        value = part.strip()
+        if value:
+            out.append(value)
+    return out
+
+
+def collect_wallet_market_filter_specs(args: argparse.Namespace) -> List[str]:
+    out = split_wallet_market_filter_specs(os.getenv("POLYMARKET_WALLET_MARKET_FILTERS"))
+    for item in args.wallet_market_filter or []:
+        out.extend(split_wallet_market_filter_specs(item))
+    return out
+
+
+def parse_wallet_market_filter_specs(raw_specs: Iterable[str]) -> List[Dict[str, Any]]:
+    parsed: List[Dict[str, Any]] = []
+    for raw_spec in raw_specs:
+        spec_text = str(raw_spec or "").strip()
+        identifier, separator, filters_text = spec_text.partition("=")
+        identifier = identifier.strip()
+        filters = parse_market_filter_text(filters_text)
+        if not separator or not identifier or not filters:
+            raise ValueError(
+                "Invalid --wallet-market-filter value. Expected wallet_or_username=bitcoin,ethereum"
+            )
+        parsed.append({"identifier": identifier, "filters": filters})
+    return parsed
+
+
+def resolve_wallet_market_filter_specs(
+    session: requests.Session,
+    specs: Iterable[Dict[str, Any]],
+    timeout: int,
+) -> Dict[str, List[str]]:
+    resolved: Dict[str, List[str]] = {}
+    for spec in specs:
+        identifier = str(spec.get("identifier") or "").strip()
+        filters = clean_market_filters(spec.get("filters"))
+        if not identifier or not filters:
+            continue
+        wallet = normalize_wallet_address(resolve_wallet(session, identifier, timeout))
+        current = resolved.get(wallet, [])
+        resolved[wallet] = clean_market_filters(current + filters)
+    return resolved
 
 
 def output_path_with_market_label(output_path: str, market_titles: Optional[Iterable[str]]) -> str:
@@ -634,8 +742,7 @@ def wallet_output_base_path(
         return output_base_path
 
     path = Path(output_base_path)
-    short_wallet = wallet.lower()
-    short_wallet = short_wallet[:8] + "_" + short_wallet[-6:] if len(short_wallet) >= 14 else short_wallet
+    short_wallet = short_wallet_display(wallet)
     label = sanitize_filename_component(wallet_label, max_len=24) if wallet_label else "wallet"
     folder_name = sanitize_filename_component(f"{label}_{short_wallet}", max_len=48)
     wallet_dir = path.parent / folder_name
@@ -959,7 +1066,15 @@ def load_continuous_state(state_path: str) -> Dict[str, Any]:
                     continue
                 seen_wallet_ids.add(normalized)
                 cleaned_wallet_ids.append(normalized)
+            raw_filters = entry.get(WALLET_MARKET_FILTERS_KEY)
+            if isinstance(raw_filters, str):
+                cleaned_filters = parse_market_filter_text(raw_filters)
+            elif isinstance(raw_filters, list):
+                cleaned_filters = clean_market_filters(raw_filters)
+            else:
+                cleaned_filters = []
             entry["processed_condition_ids"] = cleaned_wallet_ids
+            entry[WALLET_MARKET_FILTERS_KEY] = cleaned_filters
             entry["wallet"] = wallet
             cleaned_wallet_states[wallet] = entry
         state[WALLET_STATES_STATE_KEY] = cleaned_wallet_states
@@ -1026,7 +1141,16 @@ def ensure_wallet_state_entry(state: Dict[str, Any], wallet: str) -> Dict[str, A
         seen.add(normalized)
         cleaned_ids.append(normalized)
 
+    raw_filters = entry.get(WALLET_MARKET_FILTERS_KEY)
+    if isinstance(raw_filters, str):
+        cleaned_filters = parse_market_filter_text(raw_filters)
+    elif isinstance(raw_filters, list):
+        cleaned_filters = clean_market_filters(raw_filters)
+    else:
+        cleaned_filters = []
+
     entry["processed_condition_ids"] = cleaned_ids
+    entry[WALLET_MARKET_FILTERS_KEY] = cleaned_filters
     entry.setdefault("wallet", wallet_key)
     entry.setdefault("added_utc", datetime.now(timezone.utc).isoformat())
     root[wallet_key] = entry
@@ -1048,6 +1172,33 @@ def mark_wallet_condition_processed(state: Dict[str, Any], wallet: str, conditio
         processed.append(normalized)
     entry["processed_condition_ids"] = sorted({item for item in processed if item})
     entry["updated_utc"] = datetime.now(timezone.utc).isoformat()
+
+
+def get_wallet_market_filters(state: Dict[str, Any], wallet: str) -> List[str]:
+    entry = ensure_wallet_state_entry(state, wallet)
+    return clean_market_filters(entry.get(WALLET_MARKET_FILTERS_KEY))
+
+
+def set_wallet_market_filters(state: Dict[str, Any], wallet: str, filters: Iterable[str]) -> List[str]:
+    entry = ensure_wallet_state_entry(state, wallet)
+    cleaned = clean_market_filters(filters)
+    entry[WALLET_MARKET_FILTERS_KEY] = cleaned
+    entry["updated_utc"] = datetime.now(timezone.utc).isoformat()
+    return cleaned
+
+
+def add_wallet_market_filters(state: Dict[str, Any], wallet: str, filters: Iterable[str]) -> List[str]:
+    current = get_wallet_market_filters(state, wallet)
+    return set_wallet_market_filters(state, wallet, current + clean_market_filters(filters))
+
+
+def remove_wallet_market_filters(state: Dict[str, Any], wallet: str, filters: Iterable[str]) -> List[str]:
+    targets = {normalize_for_match(item) for item in clean_market_filters(filters)}
+    if not targets:
+        return get_wallet_market_filters(state, wallet)
+    current = get_wallet_market_filters(state, wallet)
+    remaining = [item for item in current if normalize_for_match(item) not in targets]
+    return set_wallet_market_filters(state, wallet, remaining)
 
 
 def get_target_wallets(state: Dict[str, Any]) -> List[str]:
@@ -1187,6 +1338,77 @@ def collect_export_report_files(export_item: Dict[str, Any]) -> List[Path]:
     return deduped
 
 
+def export_item_wallet_name(export_item: Dict[str, Any]) -> str:
+    wallet = normalize_wallet_address(export_item.get("wallet"))
+    label = str(export_item.get("wallet_label") or "").strip()
+    return label or short_wallet_display(wallet)
+
+
+def enrich_export_batch_wallet_labels(
+    state: Dict[str, Any],
+    exports_batch: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    enriched_batch: List[Dict[str, Any]] = []
+    for export_item in exports_batch:
+        enriched = dict(export_item)
+        wallet = normalize_wallet_address(enriched.get("wallet"))
+        if wallet and not str(enriched.get("wallet_label") or "").strip():
+            enriched["wallet_label"] = get_wallet_label(state, wallet)
+        enriched_batch.append(enriched)
+    return enriched_batch
+
+
+def summarize_export_batch_wallets(exports_batch: Iterable[Dict[str, Any]]) -> Dict[str, str]:
+    counts: Dict[str, int] = {}
+    display_names: Dict[str, str] = {}
+
+    for export_item in exports_batch:
+        name = export_item_wallet_name(export_item)
+        key = normalize_for_match(name)
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        display_names.setdefault(key, name)
+
+    if not counts:
+        return {
+            "caption_prefix": "Wallet",
+            "caption_text": "wallet",
+            "file_tag": "wallet",
+        }
+
+    ranked_keys = sorted(counts, key=lambda key: (-counts[key], display_names[key]))
+    if len(ranked_keys) == 1:
+        only_key = ranked_keys[0]
+        only_name = display_names[only_key]
+        return {
+            "caption_prefix": "Wallet",
+            "caption_text": only_name,
+            "file_tag": sanitize_filename_component(only_name, max_len=24),
+        }
+
+    caption_parts: List[str] = []
+    safe_parts: List[str] = []
+    for key in ranked_keys[:3]:
+        name = display_names[key]
+        count = counts[key]
+        caption_parts.append(name if count == 1 else f"{name} x{count}")
+        safe_parts.append(sanitize_filename_component(name, max_len=16))
+
+    caption_text = ", ".join(caption_parts)
+    if len(ranked_keys) > 3:
+        caption_text += f", +{len(ranked_keys) - 3} more"
+        file_tag = f"{len(ranked_keys)}wallets"
+    else:
+        file_tag = sanitize_filename_component("-".join(safe_parts), max_len=42)
+
+    return {
+        "caption_prefix": "Wallets",
+        "caption_text": caption_text,
+        "file_tag": file_tag or f"{len(ranked_keys)}wallets",
+    }
+
+
 def build_telegram_batch_zip(
     exports_batch: List[Dict[str, Any]],
     batch_start_index: int,
@@ -1195,8 +1417,10 @@ def build_telegram_batch_zip(
     zip_directory.mkdir(parents=True, exist_ok=True)
     batch_end_index = batch_start_index + len(exports_batch)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    wallet_summary = summarize_export_batch_wallets(exports_batch)
     zip_name = (
-        f"polymarket_reports_{batch_start_index + 1:05d}-{batch_end_index:05d}_{timestamp}.zip"
+        "polymarket_reports_"
+        f"{wallet_summary['file_tag']}_{batch_start_index + 1:05d}-{batch_end_index:05d}_{timestamp}.zip"
     )
     zip_path = zip_directory / zip_name
 
@@ -1358,20 +1582,121 @@ def telegram_wallet_reply_markup() -> Dict[str, Any]:
         "keyboard": [
             [
                 {"text": TELEGRAM_BUTTON_WALLETS},
+                {"text": TELEGRAM_BUTTON_SELECT},
+            ],
+            [
                 {"text": TELEGRAM_BUTTON_ADD},
-            ],
-            [
                 {"text": TELEGRAM_BUTTON_REMOVE},
-                {"text": TELEGRAM_BUTTON_SET},
             ],
             [
+                {"text": TELEGRAM_BUTTON_SET},
+                {"text": TELEGRAM_BUTTON_ADD_FILTER},
+            ],
+            [
+                {"text": TELEGRAM_BUTTON_REMOVE_FILTER},
                 {"text": TELEGRAM_BUTTON_HELP},
+            ],
+            [
                 {"text": TELEGRAM_BUTTON_CANCEL},
             ],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
+
+
+def wallet_selection_button_text(state: Dict[str, Any], wallet: str) -> str:
+    label = get_wallet_label(state, wallet)
+    short_wallet = short_wallet_display(wallet)
+    if normalize_for_match(label) == normalize_for_match(short_wallet):
+        return short_wallet
+    return f"{label} | {short_wallet}"
+
+
+def telegram_wallet_selection_reply_markup(state: Dict[str, Any]) -> Dict[str, Any]:
+    rows: List[List[Dict[str, str]]] = []
+    row: List[Dict[str, str]] = []
+    for wallet in get_target_wallets(state):
+        row.append({"text": wallet_selection_button_text(state, wallet)})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": TELEGRAM_BUTTON_CANCEL}])
+    return {
+        "keyboard": rows,
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "input_field_placeholder": "Select tracked wallet",
+    }
+
+
+def telegram_market_filter_reply_markup(filters: Iterable[str]) -> Dict[str, Any]:
+    rows = [[{"text": item}] for item in clean_market_filters(filters)]
+    rows.append([{"text": TELEGRAM_BUTTON_CANCEL}])
+    return {
+        "keyboard": rows,
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "input_field_placeholder": "Type market filter",
+    }
+
+
+def ensure_selected_wallets_root(telegram_state: Dict[str, Any]) -> Dict[str, str]:
+    root = telegram_state.get(TELEGRAM_SELECTED_WALLETS_KEY)
+    if not isinstance(root, dict):
+        root = {}
+    cleaned: Dict[str, str] = {}
+    for raw_chat_id, raw_wallet in root.items():
+        chat_runtime_id = str(raw_chat_id or "").strip()
+        wallet = normalize_wallet_address(raw_wallet)
+        if not chat_runtime_id or not wallet:
+            continue
+        cleaned[chat_runtime_id] = wallet
+    telegram_state[TELEGRAM_SELECTED_WALLETS_KEY] = cleaned
+    return cleaned
+
+
+def get_selected_wallet(
+    telegram_state: Dict[str, Any],
+    chat_runtime_id: str,
+    state: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    selected = ensure_selected_wallets_root(telegram_state)
+    wallet = normalize_wallet_address(selected.get(str(chat_runtime_id or "").strip()))
+    if not wallet:
+        return None
+    if state is not None and wallet not in get_target_wallets(state):
+        selected.pop(str(chat_runtime_id or "").strip(), None)
+        return None
+    return wallet
+
+
+def set_selected_wallet(telegram_state: Dict[str, Any], chat_runtime_id: str, wallet: str) -> None:
+    selected = ensure_selected_wallets_root(telegram_state)
+    wallet_key = normalize_wallet_address(wallet)
+    if not wallet_key:
+        return
+    selected[str(chat_runtime_id or "").strip()] = wallet_key
+
+
+def clear_selected_wallet(telegram_state: Dict[str, Any], chat_runtime_id: Optional[str] = None) -> None:
+    selected = ensure_selected_wallets_root(telegram_state)
+    if chat_runtime_id is None:
+        selected.clear()
+        return
+    selected.pop(str(chat_runtime_id or "").strip(), None)
+
+
+def clear_selected_wallet_references(telegram_state: Dict[str, Any], wallet: str) -> None:
+    wallet_key = normalize_wallet_address(wallet)
+    if not wallet_key:
+        return
+    selected = ensure_selected_wallets_root(telegram_state)
+    removable = [chat_id for chat_id, selected_wallet in selected.items() if selected_wallet == wallet_key]
+    for chat_id in removable:
+        selected.pop(chat_id, None)
 
 
 def normalize_telegram_button_text(text: str) -> str:
@@ -1381,9 +1706,12 @@ def normalize_telegram_button_text(text: str) -> str:
 def wallet_button_command_from_text(text: str) -> Optional[str]:
     mapping = {
         normalize_telegram_button_text(TELEGRAM_BUTTON_WALLETS): "wallets",
+        normalize_telegram_button_text(TELEGRAM_BUTTON_SELECT): "wallet_select",
         normalize_telegram_button_text(TELEGRAM_BUTTON_ADD): "wallet_add",
         normalize_telegram_button_text(TELEGRAM_BUTTON_REMOVE): "wallet_remove",
         normalize_telegram_button_text(TELEGRAM_BUTTON_SET): "wallet_set",
+        normalize_telegram_button_text(TELEGRAM_BUTTON_ADD_FILTER): "wallet_filter_add",
+        normalize_telegram_button_text(TELEGRAM_BUTTON_REMOVE_FILTER): "wallet_filter_remove",
         normalize_telegram_button_text(TELEGRAM_BUTTON_HELP): "wallet_help",
         normalize_telegram_button_text(TELEGRAM_BUTTON_CANCEL): "cancel",
     }
@@ -1392,12 +1720,18 @@ def wallet_button_command_from_text(text: str) -> Optional[str]:
 
 def pending_action_prompt(command: str) -> Optional[str]:
     cmd = str(command or "").strip().casefold()
+    if cmd == "wallet_select":
+        return "Choose tracked wallet or send wallet nickname/address."
     if cmd == "wallet_add":
         return "Send wallet username/address to add."
     if cmd == "wallet_remove":
         return "Send wallet username/address to remove."
     if cmd == "wallet_set":
         return "Send comma-separated wallets/usernames to track (replaces current list)."
+    if cmd == "wallet_filter_add":
+        return "Send comma-separated market filters to add for the selected wallet."
+    if cmd == "wallet_filter_remove":
+        return "Send comma-separated market filters to remove from the selected wallet."
     return None
 
 
@@ -1409,7 +1743,14 @@ def get_pending_wallet_action(telegram_state: Dict[str, Any], chat_runtime_id: s
     if pending_chat_id != str(chat_runtime_id or "").strip():
         return None
     command = str(pending.get("command") or "").strip().casefold()
-    if command not in {"wallet_add", "wallet_remove", "wallet_set"}:
+    if command not in {
+        "wallet_select",
+        "wallet_add",
+        "wallet_remove",
+        "wallet_set",
+        "wallet_filter_add",
+        "wallet_filter_remove",
+    }:
         return None
     return command
 
@@ -1498,8 +1839,12 @@ def flush_telegram_batches(
     zip_directory = Path(state_path).resolve().parent / "telegram_batches"
 
     while len(exports) - start_index >= batch_size:
-        batch = exports[start_index : start_index + batch_size]
+        batch = enrich_export_batch_wallet_labels(
+            state,
+            exports[start_index : start_index + batch_size],
+        )
         batch_end = start_index + len(batch)
+        wallet_summary = summarize_export_batch_wallets(batch)
 
         zip_path, attached_count = build_telegram_batch_zip(
             exports_batch=batch,
@@ -1508,8 +1853,9 @@ def flush_telegram_batches(
         )
 
         caption = (
-            f"Polymarket reports {start_index + 1}-{batch_end} "
-            f"({len(batch)} markets, {attached_count} files)"
+            f"Polymarket reports {start_index + 1}-{batch_end}\n"
+            f"{wallet_summary['caption_prefix']}: {wallet_summary['caption_text']}\n"
+            f"Markets: {len(batch)}, files: {attached_count}"
         )
 
         try:
@@ -1595,6 +1941,7 @@ def choose_next_active_market(
     page_limit: int,
     discovery_pages: int,
     processed_condition_ids: Iterable[str],
+    market_filters: Optional[Iterable[str]],
     start_ts: Optional[int],
     end_ts: Optional[int],
 ) -> Optional[Dict[str, Any]]:
@@ -1628,9 +1975,13 @@ def choose_next_active_market(
         if not market_is_active(market):
             continue
 
+        title = market_title_from_metadata(market, str(candidate.get("title") or ""))
+        if not market_title_matches_filters(title, market_filters):
+            continue
+
         return {
             "condition_id": condition_id,
-            "title": market_title_from_metadata(market, str(candidate.get("title") or "")),
+            "title": title,
             "latest_ts": int(candidate.get("latest_ts") or -1),
             "row_count": int(candidate.get("row_count") or 0),
             "market": market,
@@ -1807,21 +2158,43 @@ def wallet_display_name(wallet: str, label: str) -> str:
     return wallet
 
 
-def format_tracked_wallets_message(state: Dict[str, Any]) -> str:
+def format_selected_wallet_message(state: Dict[str, Any], wallet: str) -> str:
+    label = get_wallet_label(state, wallet)
+    return wallet_display_name(wallet, label)
+
+
+def format_tracked_wallets_message(
+    state: Dict[str, Any],
+    telegram_state: Optional[Dict[str, Any]] = None,
+    chat_runtime_id: str = "",
+) -> str:
     targets = get_target_wallets(state)
     if not targets:
         return "Tracked wallets: none"
 
-    lines = ["Tracked wallets:"]
+    selected_wallet = None
+    if telegram_state is not None:
+        selected_wallet = get_selected_wallet(telegram_state, chat_runtime_id, state)
+
+    lines: List[str] = []
+    if selected_wallet:
+        lines.append(f"Selected wallet: {format_selected_wallet_message(state, selected_wallet)}")
+        lines.append("")
+
+    lines.append("Tracked wallets:")
     for idx, wallet in enumerate(targets, start=1):
         label = get_wallet_label(state, wallet)
         entry = ensure_wallet_state_entry(state, wallet)
         processed_count = len(entry.get("processed_condition_ids") or [])
-        lines.append(f"{idx}) {label}: {wallet} (processed {processed_count})")
+        filters_text = format_market_filters(get_wallet_market_filters(state, wallet))
+        selected_suffix = " [selected]" if wallet == selected_wallet else ""
+        lines.append(
+            f"{idx}) {label}: {wallet} (processed {processed_count}, filters: {filters_text}){selected_suffix}"
+        )
     return "\n".join(lines)
 
 
-def resolve_wallet_for_remove_argument(
+def resolve_tracked_wallet_argument(
     session: requests.Session,
     state: Dict[str, Any],
     argument: str,
@@ -1833,6 +2206,16 @@ def resolve_wallet_for_remove_argument(
 
     targets = get_target_wallets(state)
     lowered = raw.casefold()
+
+    if raw.isdigit():
+        index = int(raw)
+        if 1 <= index <= len(targets):
+            return targets[index - 1]
+
+    button_key = normalize_telegram_button_text(raw)
+    for wallet in targets:
+        if normalize_telegram_button_text(wallet_selection_button_text(state, wallet)) == button_key:
+            return wallet
 
     if is_wallet(raw):
         wallet = normalize_wallet_address(raw)
@@ -1859,7 +2242,9 @@ def resolve_wallet_for_remove_argument(
 def apply_wallet_control_command(
     session: requests.Session,
     state: Dict[str, Any],
+    telegram_state: Dict[str, Any],
     state_path: str,
+    chat_runtime_id: str,
     command: str,
     argument: str,
     timeout: int,
@@ -1873,14 +2258,28 @@ def apply_wallet_control_command(
             "Use buttons or commands.\n\n"
             "Commands:\n"
             "/wallets - show tracked wallets\n"
+            "/wallet_select <wallet_or_nickname> - select tracked wallet\n"
             "/wallet_add <wallet_or_username> - add wallet\n"
             "/wallet_remove <wallet_or_username> - remove wallet\n"
             "/wallet_set <w1,w2,w3> - replace wallet list\n"
+            "/wallet_filter_add <bitcoin,ethereum> - add filter(s) to selected wallet\n"
+            "/wallet_filter_remove <bitcoin> - remove filter(s) from selected wallet\n"
             "/cancel - cancel pending button action",
         )
 
     if cmd in {"wallets", "wallet_list"}:
-        return (False, format_tracked_wallets_message(state))
+        return (False, format_tracked_wallets_message(state, telegram_state, chat_runtime_id))
+
+    if cmd == "wallet_select":
+        if not argument:
+            return (False, "Usage: /wallet_select <wallet_or_nickname>")
+        wallet_key = resolve_tracked_wallet_argument(session, state, argument, timeout)
+        if not wallet_key:
+            return (False, f"Tracked wallet not found: {argument}")
+        set_selected_wallet(telegram_state, chat_runtime_id, wallet_key)
+        state[TELEGRAM_STATE_KEY] = telegram_state
+        save_continuous_state(state_path, state)
+        return (True, f"Selected wallet: {format_selected_wallet_message(state, wallet_key)}")
 
     if cmd == "wallet_add":
         if not argument:
@@ -1899,11 +2298,13 @@ def apply_wallet_control_command(
     if cmd == "wallet_remove":
         if not argument:
             return (False, "Usage: /wallet_remove <wallet_or_username>")
-        wallet_key = resolve_wallet_for_remove_argument(session, state, argument, timeout)
+        wallet_key = resolve_tracked_wallet_argument(session, state, argument, timeout)
         if not wallet_key:
             return (False, f"Wallet not found in target list: {argument}")
         targets = [wallet for wallet in get_target_wallets(state) if wallet != wallet_key]
         set_target_wallets(state, targets)
+        clear_selected_wallet_references(telegram_state, wallet_key)
+        state[TELEGRAM_STATE_KEY] = telegram_state
         save_continuous_state(state_path, state)
         return (True, f"Removed wallet: {wallet_key}")
 
@@ -1920,8 +2321,49 @@ def apply_wallet_control_command(
         for identifier, wallet in resolved_pairs:
             set_wallet_label(state, wallet, identifier)
         targets = set_target_wallets(state, [wallet for _, wallet in resolved_pairs])
+        for tracked_wallet in list(ensure_selected_wallets_root(telegram_state).values()):
+            if tracked_wallet not in targets:
+                clear_selected_wallet_references(telegram_state, tracked_wallet)
+        state[TELEGRAM_STATE_KEY] = telegram_state
         save_continuous_state(state_path, state)
         return (True, f"Updated target wallets ({len(targets)}).")
+
+    if cmd == "wallet_filter_add":
+        selected_wallet = get_selected_wallet(telegram_state, chat_runtime_id, state)
+        if not selected_wallet:
+            return (False, "Select a tracked wallet first with Select Wallet or /wallet_select.")
+        filters = parse_market_filter_text(argument)
+        if not filters:
+            return (False, "Usage: /wallet_filter_add <bitcoin,ethereum>")
+        updated_filters = add_wallet_market_filters(state, selected_wallet, filters)
+        save_continuous_state(state_path, state)
+        return (
+            True,
+            "Updated filters for "
+            f"{format_selected_wallet_message(state, selected_wallet)}: {format_market_filters(updated_filters)}",
+        )
+
+    if cmd == "wallet_filter_remove":
+        selected_wallet = get_selected_wallet(telegram_state, chat_runtime_id, state)
+        if not selected_wallet:
+            return (False, "Select a tracked wallet first with Select Wallet or /wallet_select.")
+        filters = parse_market_filter_text(argument)
+        if not filters:
+            return (False, "Usage: /wallet_filter_remove <bitcoin>")
+        before = get_wallet_market_filters(state, selected_wallet)
+        after = remove_wallet_market_filters(state, selected_wallet, filters)
+        if before == after:
+            return (
+                False,
+                "No matching filters were removed for "
+                f"{format_selected_wallet_message(state, selected_wallet)}. Current filters: {format_market_filters(after)}",
+            )
+        save_continuous_state(state_path, state)
+        return (
+            True,
+            "Updated filters for "
+            f"{format_selected_wallet_message(state, selected_wallet)}: {format_market_filters(after)}",
+        )
 
     return (False, None)
 
@@ -1952,7 +2394,7 @@ def poll_telegram_control_commands(
 
     changed = False
     next_offset = offset if offset is not None else 0
-    keyboard = telegram_wallet_reply_markup()
+    base_keyboard = telegram_wallet_reply_markup()
 
     for update in updates:
         if not isinstance(update, dict):
@@ -1983,16 +2425,55 @@ def poll_telegram_control_commands(
         pending_command = get_pending_wallet_action(telegram_state, chat_runtime_id)
 
         response_text: Optional[str] = None
+        response_markup: Optional[Dict[str, Any]] = base_keyboard
         command_to_run: Optional[str] = None
         argument_to_run = ""
         consumed_pending_command: Optional[str] = None
+        selected_wallet = get_selected_wallet(telegram_state, chat_runtime_id, state)
 
         if command == "cancel" or button_command == "cancel":
             clear_pending_wallet_action(telegram_state, chat_runtime_id)
             response_text = "Canceled."
+        elif not command and button_command == "wallet_select":
+            if not get_target_wallets(state):
+                response_text = "Tracked wallets: none. Add a wallet first."
+            else:
+                set_pending_wallet_action(telegram_state, chat_runtime_id, button_command)
+                response_text = pending_action_prompt(button_command) or "Choose wallet."
+                response_markup = telegram_wallet_selection_reply_markup(state)
         elif not command and button_command in {"wallet_add", "wallet_remove", "wallet_set"}:
             set_pending_wallet_action(telegram_state, chat_runtime_id, button_command)
             response_text = pending_action_prompt(button_command) or "Send value."
+        elif not command and button_command == "wallet_filter_add":
+            if not selected_wallet:
+                response_text = "Select a tracked wallet first."
+                if get_target_wallets(state):
+                    response_markup = telegram_wallet_selection_reply_markup(state)
+            else:
+                set_pending_wallet_action(telegram_state, chat_runtime_id, button_command)
+                response_text = (
+                    f"Selected wallet: {format_selected_wallet_message(state, selected_wallet)}\n"
+                    + (pending_action_prompt(button_command) or "Send filter.")
+                )
+        elif not command and button_command == "wallet_filter_remove":
+            if not selected_wallet:
+                response_text = "Select a tracked wallet first."
+                if get_target_wallets(state):
+                    response_markup = telegram_wallet_selection_reply_markup(state)
+            else:
+                current_filters = get_wallet_market_filters(state, selected_wallet)
+                if not current_filters:
+                    response_text = (
+                        f"{format_selected_wallet_message(state, selected_wallet)} has no filters to remove."
+                    )
+                else:
+                    set_pending_wallet_action(telegram_state, chat_runtime_id, button_command)
+                    response_text = (
+                        f"Selected wallet: {format_selected_wallet_message(state, selected_wallet)}\n"
+                        f"Current filters: {format_market_filters(current_filters)}\n"
+                        + (pending_action_prompt(button_command) or "Send filter.")
+                    )
+                    response_markup = telegram_market_filter_reply_markup(current_filters)
         else:
             if command:
                 command_to_run = command
@@ -2015,7 +2496,7 @@ def poll_telegram_control_commands(
                     chat_id=chat_id,
                     text=response_text,
                     timeout=max(5, timeout),
-                    reply_markup=keyboard,
+                    reply_markup=response_markup,
                 )
             except Exception as exc:
                 print(f"Warning: failed to send Telegram UI response: {exc}", file=sys.stderr)
@@ -2025,7 +2506,9 @@ def poll_telegram_control_commands(
             was_changed, response_text = apply_wallet_control_command(
                 session=session,
                 state=state,
+                telegram_state=telegram_state,
                 state_path=state_path,
+                chat_runtime_id=chat_runtime_id,
                 command=str(command_to_run or ""),
                 argument=argument_to_run,
                 timeout=timeout,
@@ -2038,7 +2521,7 @@ def poll_telegram_control_commands(
                     chat_id=chat_id,
                     text=response_text,
                     timeout=max(5, timeout),
-                    reply_markup=keyboard,
+                    reply_markup=base_keyboard,
                 )
         except Exception as exc:
             if consumed_pending_command:
@@ -2051,7 +2534,7 @@ def poll_telegram_control_commands(
                     chat_id=chat_id,
                     text=error_text + "\nTry again or press Cancel.",
                     timeout=max(5, timeout),
-                    reply_markup=keyboard,
+                    reply_markup=base_keyboard,
                 )
             except Exception:
                 pass
@@ -2107,6 +2590,7 @@ def wallet_worker_loop(
 
         with state_lock:
             processed_set = get_wallet_processed_set(state, wallet)
+            market_filters = get_wallet_market_filters(state, wallet)
 
         try:
             candidate = choose_next_active_market(
@@ -2116,6 +2600,7 @@ def wallet_worker_loop(
                 page_limit=page_limit,
                 discovery_pages=discovery_pages,
                 processed_condition_ids=processed_set,
+                market_filters=market_filters,
                 start_ts=start_ts,
                 end_ts=end_ts,
             )
@@ -2241,6 +2726,7 @@ def wallet_worker_loop(
 def run_continuous_collection(
     session: requests.Session,
     resolved_wallets: List[Dict[str, str]],
+    initial_wallet_market_filters: Dict[str, List[str]],
     output_base_path: str,
     timeout: int,
     page_limit: int,
@@ -2278,6 +2764,11 @@ def run_continuous_collection(
         if not wallet:
             continue
         initial_wallets.append(wallet)
+    for wallet in initial_wallet_market_filters:
+        wallet_key = normalize_wallet_address(wallet)
+        if wallet_key:
+            initial_wallets.append(wallet_key)
+    initial_wallets = list(dict.fromkeys(initial_wallets))
 
     with state_lock:
         for wallet_entry in resolved_wallets:
@@ -2287,6 +2778,13 @@ def run_continuous_collection(
             ensure_wallet_state_entry(state, wallet)
             label = str(wallet_entry.get("label") or wallet_entry.get("input") or wallet)
             set_wallet_label(state, wallet, label)
+
+        for wallet, filters in initial_wallet_market_filters.items():
+            wallet_key = normalize_wallet_address(wallet)
+            if not wallet_key:
+                continue
+            ensure_wallet_state_entry(state, wallet_key)
+            set_wallet_market_filters(state, wallet_key, filters)
 
         existing_targets = get_target_wallets(state)
         merged_targets = list(existing_targets)
@@ -2348,7 +2846,10 @@ def run_continuous_collection(
             print("Telegram backlog mode: enabled (will send existing unsent exports).", file=sys.stderr)
         if telegram_control_enabled:
             print(
-                "Telegram control enabled (buttons + commands): /wallets, /wallet_add, /wallet_remove, /wallet_set",
+                (
+                    "Telegram control enabled (buttons + commands): /wallets, /wallet_select, "
+                    "/wallet_add, /wallet_remove, /wallet_set, /wallet_filter_add, /wallet_filter_remove"
+                ),
                 file=sys.stderr,
             )
     else:
@@ -3673,6 +4174,14 @@ def main() -> int:
     args = parse_args()
 
     try:
+        wallet_market_filter_specs = parse_wallet_market_filter_specs(
+            collect_wallet_market_filter_specs(args)
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
         start_ts = parse_utc_to_unix(args.start)
         end_ts = parse_utc_to_unix(args.end)
     except ValueError as exc:
@@ -3801,6 +4310,11 @@ def main() -> int:
                 "Warning: Telegram settings are used only in --continuous mode and will be ignored.",
                 file=sys.stderr,
             )
+        if wallet_market_filter_specs:
+            print(
+                "Warning: --wallet-market-filter applies only in --continuous mode and will be ignored.",
+                file=sys.stderr,
+            )
         if args.telegram_send_existing:
             print(
                 "Warning: --telegram-send-existing applies only in --continuous mode and will be ignored.",
@@ -3814,6 +4328,15 @@ def main() -> int:
 
     try:
         wallet_identifiers = ensure_wallet_identifiers_for_mode(args)
+        if args.continuous and wallet_market_filter_specs:
+            seen_wallet_identifiers = {item.casefold() for item in wallet_identifiers}
+            for spec in wallet_market_filter_specs:
+                identifier = str(spec.get("identifier") or "").strip()
+                key = identifier.casefold()
+                if not identifier or key in seen_wallet_identifiers:
+                    continue
+                seen_wallet_identifiers.add(key)
+                wallet_identifiers.append(identifier)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -3826,10 +4349,17 @@ def main() -> int:
 
     try:
         resolved_wallet_entries: List[Dict[str, str]] = []
+        resolved_wallet_market_filters: Dict[str, List[str]] = {}
         if wallet_identifiers:
             resolved_wallet_entries = resolve_wallet_identifiers(
                 session=session,
                 identifiers=wallet_identifiers,
+                timeout=args.timeout,
+            )
+        if args.continuous and wallet_market_filter_specs:
+            resolved_wallet_market_filters = resolve_wallet_market_filter_specs(
+                session=session,
+                specs=wallet_market_filter_specs,
                 timeout=args.timeout,
             )
 
@@ -3849,6 +4379,7 @@ def main() -> int:
             return run_continuous_collection(
                 session=session,
                 resolved_wallets=resolved_wallet_entries,
+                initial_wallet_market_filters=resolved_wallet_market_filters,
                 output_base_path=args.output,
                 timeout=args.timeout,
                 page_limit=args.limit,
