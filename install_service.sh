@@ -22,17 +22,25 @@ if [[ $EUID -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
   exit 1
 fi
 
-required_vars=(TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
-for var_name in "${required_vars[@]}"; do
-  if [[ -z "${!var_name:-}" ]]; then
-    echo "Error: missing required env var: ${var_name}" >&2
-    exit 1
-  fi
-done
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" && -t 0 ]]; then
+  read -r -s -p "Enter TELEGRAM_BOT_TOKEN: " TELEGRAM_BOT_TOKEN
+  echo
+fi
+if [[ -z "${TELEGRAM_CHAT_ID:-}" && -t 0 ]]; then
+  read -r -p "Enter TELEGRAM_CHAT_ID: " TELEGRAM_CHAT_ID
+fi
 
-if [[ -z "${POLYMARKET_WALLETS:-}" && -z "${POLYMARKET_WALLET:-}" ]]; then
-  echo "Error: set POLYMARKET_WALLETS or POLYMARKET_WALLET" >&2
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  echo "Error: missing TELEGRAM_BOT_TOKEN" >&2
   exit 1
+fi
+if [[ -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+  echo "Error: missing TELEGRAM_CHAT_ID" >&2
+  exit 1
+fi
+
+if [[ -z "${POLYMARKET_WALLETS:-}" && -z "${POLYMARKET_WALLET:-}" && -t 0 ]]; then
+  read -r -p "Optional initial wallets (comma-separated, leave blank to add via Telegram): " POLYMARKET_WALLETS
 fi
 
 cd "$ROOT_DIR"

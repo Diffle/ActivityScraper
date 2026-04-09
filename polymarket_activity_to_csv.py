@@ -51,6 +51,13 @@ TELEGRAM_SENT_BATCHES_LIMIT = 200
 TELEGRAM_SEND_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 TELEGRAM_DEFAULT_GET_UPDATES_TIMEOUT_SECONDS = 1
 TELEGRAM_UPDATES_LIMIT = 50
+TELEGRAM_PENDING_ACTION_KEY = "pending_action"
+TELEGRAM_BUTTON_WALLETS = "Wallets"
+TELEGRAM_BUTTON_ADD = "Add Wallet"
+TELEGRAM_BUTTON_REMOVE = "Remove Wallet"
+TELEGRAM_BUTTON_SET = "Set Wallets"
+TELEGRAM_BUTTON_HELP = "Help"
+TELEGRAM_BUTTON_CANCEL = "Cancel"
 TARGET_WALLETS_STATE_KEY = "target_wallets"
 WALLET_STATES_STATE_KEY = "wallet_states"
 WALLET_LABELS_STATE_KEY = "wallet_labels"
@@ -1276,12 +1283,15 @@ def send_telegram_message(
     chat_id: str,
     text: str,
     timeout: int,
+    reply_markup: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text[:4096],
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
     response = requests.post(url, data=payload, timeout=timeout)
     response.raise_for_status()
     body = response.json()
@@ -1341,6 +1351,97 @@ def parse_telegram_command(text: str) -> tuple[str, str]:
     command = command.split("@", 1)[0].strip().casefold()
     argument = rest.strip()
     return (command, argument)
+
+
+def telegram_wallet_reply_markup() -> Dict[str, Any]:
+    return {
+        "keyboard": [
+            [
+                {"text": TELEGRAM_BUTTON_WALLETS},
+                {"text": TELEGRAM_BUTTON_ADD},
+            ],
+            [
+                {"text": TELEGRAM_BUTTON_REMOVE},
+                {"text": TELEGRAM_BUTTON_SET},
+            ],
+            [
+                {"text": TELEGRAM_BUTTON_HELP},
+                {"text": TELEGRAM_BUTTON_CANCEL},
+            ],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+
+def normalize_telegram_button_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
+
+
+def wallet_button_command_from_text(text: str) -> Optional[str]:
+    mapping = {
+        normalize_telegram_button_text(TELEGRAM_BUTTON_WALLETS): "wallets",
+        normalize_telegram_button_text(TELEGRAM_BUTTON_ADD): "wallet_add",
+        normalize_telegram_button_text(TELEGRAM_BUTTON_REMOVE): "wallet_remove",
+        normalize_telegram_button_text(TELEGRAM_BUTTON_SET): "wallet_set",
+        normalize_telegram_button_text(TELEGRAM_BUTTON_HELP): "wallet_help",
+        normalize_telegram_button_text(TELEGRAM_BUTTON_CANCEL): "cancel",
+    }
+    return mapping.get(normalize_telegram_button_text(text))
+
+
+def pending_action_prompt(command: str) -> Optional[str]:
+    cmd = str(command or "").strip().casefold()
+    if cmd == "wallet_add":
+        return "Send wallet username/address to add."
+    if cmd == "wallet_remove":
+        return "Send wallet username/address to remove."
+    if cmd == "wallet_set":
+        return "Send comma-separated wallets/usernames to track (replaces current list)."
+    return None
+
+
+def get_pending_wallet_action(telegram_state: Dict[str, Any], chat_runtime_id: str) -> Optional[str]:
+    pending = telegram_state.get(TELEGRAM_PENDING_ACTION_KEY)
+    if not isinstance(pending, dict):
+        return None
+    pending_chat_id = str(pending.get("chat_id") or "").strip()
+    if pending_chat_id != str(chat_runtime_id or "").strip():
+        return None
+    command = str(pending.get("command") or "").strip().casefold()
+    if command not in {"wallet_add", "wallet_remove", "wallet_set"}:
+        return None
+    return command
+
+
+def set_pending_wallet_action(
+    telegram_state: Dict[str, Any],
+    chat_runtime_id: str,
+    command: str,
+) -> None:
+    telegram_state[TELEGRAM_PENDING_ACTION_KEY] = {
+        "chat_id": str(chat_runtime_id or "").strip(),
+        "command": str(command or "").strip().casefold(),
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def clear_pending_wallet_action(
+    telegram_state: Dict[str, Any],
+    chat_runtime_id: Optional[str] = None,
+) -> None:
+    pending = telegram_state.get(TELEGRAM_PENDING_ACTION_KEY)
+    if not isinstance(pending, dict):
+        telegram_state.pop(TELEGRAM_PENDING_ACTION_KEY, None)
+        return
+
+    if chat_runtime_id is None:
+        telegram_state.pop(TELEGRAM_PENDING_ACTION_KEY, None)
+        return
+
+    pending_chat_id = str(pending.get("chat_id") or "").strip()
+    if pending_chat_id == str(chat_runtime_id).strip():
+        telegram_state.pop(TELEGRAM_PENDING_ACTION_KEY, None)
 
 
 def ensure_telegram_state(
@@ -1768,11 +1869,14 @@ def apply_wallet_control_command(
     if cmd in {"start", "help", "wallet_help"}:
         return (
             False,
+            "Wallet control:\n"
+            "Use buttons or commands.\n\n"
             "Commands:\n"
             "/wallets - show tracked wallets\n"
             "/wallet_add <wallet_or_username> - add wallet\n"
             "/wallet_remove <wallet_or_username> - remove wallet\n"
-            "/wallet_set <w1,w2,w3> - replace wallet list",
+            "/wallet_set <w1,w2,w3> - replace wallet list\n"
+            "/cancel - cancel pending button action",
         )
 
     if cmd in {"wallets", "wallet_list"}:
@@ -1848,6 +1952,7 @@ def poll_telegram_control_commands(
 
     changed = False
     next_offset = offset if offset is not None else 0
+    keyboard = telegram_wallet_reply_markup()
 
     for update in updates:
         if not isinstance(update, dict):
@@ -1864,9 +1969,56 @@ def poll_telegram_control_commands(
         if not telegram_chat_matches(message.get("chat"), chat_id):
             continue
 
-        text = str(message.get("text") or "")
+        chat_obj = message.get("chat")
+        chat_runtime_id = ""
+        if isinstance(chat_obj, dict):
+            chat_runtime_id = str(chat_obj.get("id") or "").strip()
+
+        text = str(message.get("text") or "").strip()
+        if not text:
+            continue
+
         command, argument = parse_telegram_command(text)
-        if not command:
+        button_command = wallet_button_command_from_text(text)
+        pending_command = get_pending_wallet_action(telegram_state, chat_runtime_id)
+
+        response_text: Optional[str] = None
+        command_to_run: Optional[str] = None
+        argument_to_run = ""
+        consumed_pending_command: Optional[str] = None
+
+        if command == "cancel" or button_command == "cancel":
+            clear_pending_wallet_action(telegram_state, chat_runtime_id)
+            response_text = "Canceled."
+        elif not command and button_command in {"wallet_add", "wallet_remove", "wallet_set"}:
+            set_pending_wallet_action(telegram_state, chat_runtime_id, button_command)
+            response_text = pending_action_prompt(button_command) or "Send value."
+        else:
+            if command:
+                command_to_run = command
+                argument_to_run = argument
+            elif button_command:
+                command_to_run = button_command
+                argument_to_run = ""
+            elif pending_command:
+                command_to_run = pending_command
+                argument_to_run = text
+                consumed_pending_command = pending_command
+                clear_pending_wallet_action(telegram_state, chat_runtime_id)
+            else:
+                continue
+
+        if response_text is not None:
+            try:
+                send_telegram_message(
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    text=response_text,
+                    timeout=max(5, timeout),
+                    reply_markup=keyboard,
+                )
+            except Exception as exc:
+                print(f"Warning: failed to send Telegram UI response: {exc}", file=sys.stderr)
             continue
 
         try:
@@ -1874,8 +2026,8 @@ def poll_telegram_control_commands(
                 session=session,
                 state=state,
                 state_path=state_path,
-                command=command,
-                argument=argument,
+                command=str(command_to_run or ""),
+                argument=argument_to_run,
                 timeout=timeout,
             )
             if was_changed:
@@ -1886,16 +2038,20 @@ def poll_telegram_control_commands(
                     chat_id=chat_id,
                     text=response_text,
                     timeout=max(5, timeout),
+                    reply_markup=keyboard,
                 )
         except Exception as exc:
+            if consumed_pending_command:
+                set_pending_wallet_action(telegram_state, chat_runtime_id, consumed_pending_command)
             error_text = f"Command failed: {exc}"
             print(f"Warning: {error_text}", file=sys.stderr)
             try:
                 send_telegram_message(
                     bot_token=bot_token,
                     chat_id=chat_id,
-                    text=error_text,
+                    text=error_text + "\nTry again or press Cancel.",
                     timeout=max(5, timeout),
+                    reply_markup=keyboard,
                 )
             except Exception:
                 pass
@@ -2142,9 +2298,12 @@ def run_continuous_collection(
             merged_targets.append(wallet)
         targets = set_target_wallets(state, merged_targets)
 
-        if not targets:
+        if not targets and not (telegram_enabled and telegram_control_enabled):
             raise RuntimeError(
-                "No target wallets configured. Provide --wallet/--wallets or add wallets via Telegram commands."
+                (
+                    "No target wallets configured. Provide --wallet/--wallets, "
+                    "or enable Telegram control and add wallets via /wallet_add."
+                )
             )
 
         if len(targets) == 1:
@@ -2168,6 +2327,14 @@ def run_continuous_collection(
         file=sys.stderr,
     )
     print(f"Continuous state file: {state_path}", file=sys.stderr)
+    if not get_target_wallets(state):
+        print(
+            (
+                "No wallets configured at startup. "
+                "Waiting for Telegram commands (/wallet_add or /wallet_set)."
+            ),
+            file=sys.stderr,
+        )
 
     if telegram_enabled:
         print(
@@ -2180,7 +2347,10 @@ def run_continuous_collection(
         if telegram_send_existing:
             print("Telegram backlog mode: enabled (will send existing unsent exports).", file=sys.stderr)
         if telegram_control_enabled:
-            print("Telegram control enabled: /wallets, /wallet_add, /wallet_remove, /wallet_set", file=sys.stderr)
+            print(
+                "Telegram control enabled (buttons + commands): /wallets, /wallet_add, /wallet_remove, /wallet_set",
+                file=sys.stderr,
+            )
     else:
         print("Telegram delivery disabled (missing token/chat id).", file=sys.stderr)
 
@@ -2194,6 +2364,20 @@ def run_continuous_collection(
                 batch_size=telegram_batch_size,
                 timeout=max(timeout, TELEGRAM_DEFAULT_SEND_TIMEOUT_SECONDS),
             )
+            if telegram_control_enabled:
+                try:
+                    send_telegram_message(
+                        bot_token=telegram_bot_token,
+                        chat_id=telegram_chat_id,
+                        text=(
+                            "Polymarket bot is running. Use buttons or commands to manage wallets.\n\n"
+                            + format_tracked_wallets_message(state)
+                        ),
+                        timeout=max(5, timeout),
+                        reply_markup=telegram_wallet_reply_markup(),
+                    )
+                except Exception as exc:
+                    print(f"Warning: failed to send Telegram control panel: {exc}", file=sys.stderr)
 
     workers: Dict[str, Dict[str, Any]] = {}
 

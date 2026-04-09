@@ -19,13 +19,26 @@ source ".venv/bin/activate"
 python -m pip install --upgrade pip >/dev/null
 python -m pip install -r requirements.txt >/dev/null
 
-required_vars=(TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
-for var_name in "${required_vars[@]}"; do
-  if [[ -z "${!var_name:-}" ]]; then
-    echo "Error: missing required env var: ${var_name}" >&2
-    exit 1
-  fi
-done
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" && -t 0 ]]; then
+  read -r -s -p "Enter TELEGRAM_BOT_TOKEN: " TELEGRAM_BOT_TOKEN
+  echo
+fi
+if [[ -z "${TELEGRAM_CHAT_ID:-}" && -t 0 ]]; then
+  read -r -p "Enter TELEGRAM_CHAT_ID: " TELEGRAM_CHAT_ID
+fi
+
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  echo "Error: missing TELEGRAM_BOT_TOKEN" >&2
+  exit 1
+fi
+if [[ -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+  echo "Error: missing TELEGRAM_CHAT_ID" >&2
+  exit 1
+fi
+
+if [[ -z "${POLYMARKET_WALLETS:-}" && -z "${POLYMARKET_WALLET:-}" && -t 0 ]]; then
+  read -r -p "Optional initial wallets (comma-separated, leave blank to add via Telegram): " POLYMARKET_WALLETS
+fi
 
 wallet_args=()
 if [[ -n "${POLYMARKET_WALLETS:-}" ]]; then
@@ -33,8 +46,7 @@ if [[ -n "${POLYMARKET_WALLETS:-}" ]]; then
 elif [[ -n "${POLYMARKET_WALLET:-}" ]]; then
   wallet_args+=(--wallet "$POLYMARKET_WALLET")
 else
-  echo "Error: set POLYMARKET_WALLETS or POLYMARKET_WALLET" >&2
-  exit 1
+  echo "Info: no initial wallets set, bot will wait for /wallet_add or /wallet_set in Telegram." >&2
 fi
 
 POLYMARKET_OUTPUT="${POLYMARKET_OUTPUT:-polymarket_activity.csv}"

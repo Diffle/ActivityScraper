@@ -12,22 +12,25 @@ It supports:
 ```bash
 cd /path/to/ActivityScraper
 chmod +x run_vps.sh run_service.sh install_service.sh
-POLYMARKET_WALLETS="vidarx,another_wallet" \
-TELEGRAM_BOT_TOKEN="123456:ABCDEF" \
-TELEGRAM_CHAT_ID="-1001234567890" \
 bash run_vps.sh
 ```
+
+`run_vps.sh` will ask interactively for:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- optional initial wallets
 
 ## One-command service install (keeps running after SSH disconnect)
 
 ```bash
 cd /path/to/ActivityScraper
 chmod +x run_vps.sh run_service.sh install_service.sh
-POLYMARKET_WALLETS="vidarx,another_wallet" \
-TELEGRAM_BOT_TOKEN="123456:ABCDEF" \
-TELEGRAM_CHAT_ID="-1001234567890" \
 bash install_service.sh
 ```
+
+`install_service.sh` also prompts interactively for Telegram credentials and optional initial wallets.
+You can leave wallets empty and add them later via Telegram commands.
 
 After install:
 
@@ -38,6 +41,7 @@ After install:
 
 ## Optional env vars
 
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (required, but can be entered interactively in `.sh` scripts)
 - `POLYMARKET_WALLET` (single wallet fallback)
 - `POLYMARKET_WALLETS` (comma-separated multi-wallet list)
 - `POLYMARKET_TELEGRAM_BATCH_SIZE` (default `10`)
@@ -51,13 +55,23 @@ After install:
 
 ## Telegram wallet control commands
 
-Send these to your bot in the configured chat:
+The bot sends a reply-keyboard with buttons:
+
+- `Wallets`
+- `Add Wallet`
+- `Remove Wallet`
+- `Set Wallets`
+- `Help`
+- `Cancel`
+
+You can still send commands manually:
 
 - `/wallets` - list tracked wallets
 - `/wallet_add <wallet_or_username>` - add a target wallet
 - `/wallet_remove <wallet_or_username>` - remove wallet from tracking
 - `/wallet_set <w1,w2,w3>` - replace the full wallet list
 - `/wallet_help` - show command help
+- `/cancel` - cancel pending button action
 
 Note: command control uses Telegram `getUpdates` polling (not webhook mode).
 Only commands from your configured `TELEGRAM_CHAT_ID` are applied.

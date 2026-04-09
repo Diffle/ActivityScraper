@@ -22,9 +22,6 @@ if [[ -n "${POLYMARKET_WALLETS:-}" ]]; then
   wallet_args+=(--wallets "$POLYMARKET_WALLETS")
 elif [[ -n "${POLYMARKET_WALLET:-}" ]]; then
   wallet_args+=(--wallet "$POLYMARKET_WALLET")
-else
-  echo "Error: set POLYMARKET_WALLETS or POLYMARKET_WALLET" >&2
-  exit 1
 fi
 
 POLYMARKET_OUTPUT="${POLYMARKET_OUTPUT:-polymarket_activity.csv}"
