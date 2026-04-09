@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: python3 is required." >&2
+  exit 1
+fi
+
+if [[ ! -d ".venv" ]]; then
+  python3 -m venv .venv
+fi
+
+# shellcheck disable=SC1091
+source ".venv/bin/activate"
+
+python -m pip install --upgrade pip >/dev/null
+python -m pip install -r requirements.txt >/dev/null
+
+required_vars=(POLYMARKET_WALLET TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
+for var_name in "${required_vars[@]}"; do
+  if [[ -z "${!var_name:-}" ]]; then
+    echo "Error: missing required env var: ${var_name}" >&2
+    exit 1
+  fi
+done
+
+POLYMARKET_OUTPUT="${POLYMARKET_OUTPUT:-polymarket_activity.csv}"
+POLYMARKET_LIMIT="${POLYMARKET_LIMIT:-500}"
+POLYMARKET_POLL_SECONDS="${POLYMARKET_POLL_SECONDS:-10}"
+POLYMARKET_FINALIZE_GRACE_SECONDS="${POLYMARKET_FINALIZE_GRACE_SECONDS:-20}"
+POLYMARKET_DISCOVERY_PAGES="${POLYMARKET_DISCOVERY_PAGES:-2}"
+POLYMARKET_STATE_FILE="${POLYMARKET_STATE_FILE:-polymarket_continuous_state.json}"
+POLYMARKET_TELEGRAM_BATCH_SIZE="${POLYMARKET_TELEGRAM_BATCH_SIZE:-10}"
+
+extra_args=()
+if [[ -n "${POLYMARKET_CONTINUOUS_MAX_MARKETS:-}" ]]; then
+  extra_args+=(--continuous-max-markets "$POLYMARKET_CONTINUOUS_MAX_MARKETS")
+fi
+if [[ "${POLYMARKET_TELEGRAM_SEND_EXISTING:-0}" == "1" ]]; then
+  extra_args+=(--telegram-send-existing)
+fi
+
+exec python polymarket_activity_to_csv.py \
+  --continuous \
+  --wallet "$POLYMARKET_WALLET" \
+  --output "$POLYMARKET_OUTPUT" \
+  --limit "$POLYMARKET_LIMIT" \
+  --poll-seconds "$POLYMARKET_POLL_SECONDS" \
+  --finalize-grace-seconds "$POLYMARKET_FINALIZE_GRACE_SECONDS" \
+  --continuous-discovery-pages "$POLYMARKET_DISCOVERY_PAGES" \
+  --continuous-state-file "$POLYMARKET_STATE_FILE" \
+  --telegram-bot-token "$TELEGRAM_BOT_TOKEN" \
+  --telegram-chat-id "$TELEGRAM_CHAT_ID" \
+  --telegram-batch-size "$POLYMARKET_TELEGRAM_BATCH_SIZE" \
+  "${extra_args[@]}"
