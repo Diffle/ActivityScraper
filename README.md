@@ -7,6 +7,9 @@ It supports:
 - Multiple wallets in parallel (`POLYMARKET_WALLETS="wallet1,wallet2,wallet3"`)
 - Per-wallet market filters (for example `bitcoin`, `ethereum`, `xrp`)
 - Telegram command control to update targets at runtime
+- Human-readable Telegram ZIP layout grouped as `wallet nickname -> market/time -> files`
+  (falls back to full wallet address when nickname is unavailable)
+- CSV export appends one trailing `SUMMARY` row with realized PnL and inferred winner
 
 ## Quick run (foreground)
 
@@ -87,6 +90,9 @@ You can still send commands manually:
 - `/wallet_filter_remove <bitcoin>` - remove market filters from the selected wallet
 - `/wallet_help` - show command help
 - `/cancel` - cancel pending button action
+
+When you add a wallet by address (`0x...`), the bot tries to resolve and use the Polymarket profile name
+as the wallet nickname automatically (when available).
 
 Note: command control uses Telegram `getUpdates` polling (not webhook mode).
 Only commands from your configured `TELEGRAM_CHAT_ID` are applied.

@@ -95,6 +95,12 @@ REFERENCE_3_MAX_BET_USDC = 20.0
 REFERENCE_3_MAX_PRICE = 1.0
 INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 MARKET_FILENAME_MAX_LEN = 90
+MARKET_TIME_RANGE_RE = re.compile(
+    r"\d{1,2}:\d{2}\s*[AP]M\s*-\s*\d{1,2}:\d{2}\s*[AP]M(?:\s*ET)?",
+    flags=re.IGNORECASE,
+)
+UP_OR_DOWN_TITLE_RE = re.compile(r"^(?P<asset>.+?)\s+Up or Down\b", flags=re.IGNORECASE)
+WALLET_HEX_FRAGMENT_RE = re.compile(r"^0x[a-f0-9]{8,40}$")
 
 
 def is_wallet(value: str) -> bool:
@@ -389,22 +395,151 @@ def session_with_headers() -> requests.Session:
     return session
 
 
+def fetch_public_search_profiles(
+    session: requests.Session,
+    query: str,
+    timeout: int,
+    limit_per_type: int = 10,
+) -> List[Dict[str, Any]]:
+    url = urljoin(GAMMA_API, "public-search")
+    params = {
+        "q": str(query or "").strip(),
+        "search_profiles": "true",
+        "limit_per_type": max(1, int(limit_per_type)),
+        "page": 1,
+    }
+    resp = session.get(url, params=params, timeout=timeout)
+    resp.raise_for_status()
+
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        return []
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, list):
+        return []
+    return [item for item in profiles if isinstance(item, dict)]
+
+
+def profile_display_label(profile: Dict[str, Any]) -> str:
+    name = str(profile.get("name") or "").strip()
+    if name:
+        return name
+    return str(profile.get("pseudonym") or "").strip()
+
+
+def fetch_wallet_profile_from_activity(
+    session: requests.Session,
+    wallet: str,
+    timeout: int,
+) -> Optional[Dict[str, Any]]:
+    wallet_key = normalize_wallet_address(wallet)
+    if not wallet_key:
+        return None
+
+    url = urljoin(DATA_API, "activity")
+    params = {
+        "user": wallet_key,
+        "limit": 1,
+        "offset": 0,
+        "sortBy": "TIMESTAMP",
+        "sortDirection": "DESC",
+    }
+    response = session.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list) or not payload:
+        return None
+    first = payload[0]
+    if not isinstance(first, dict):
+        return None
+    proxy_wallet = normalize_wallet_address(first.get("proxyWallet"))
+    if proxy_wallet and proxy_wallet != wallet_key:
+        return None
+    return first
+
+
+def resolve_wallet_profile_label(
+    session: requests.Session,
+    wallet: str,
+    timeout: int,
+) -> Optional[str]:
+    wallet_key = normalize_wallet_address(wallet)
+    if not wallet_key:
+        return None
+
+    try:
+        profiles = fetch_public_search_profiles(session, wallet_key, timeout, limit_per_type=25)
+    except Exception:
+        profiles = []
+
+    exact_wallet_matches: List[Dict[str, Any]] = []
+    for profile in profiles:
+        proxy_wallet = normalize_wallet_address(profile.get("proxyWallet"))
+        if proxy_wallet == wallet_key:
+            exact_wallet_matches.append(profile)
+
+    if exact_wallet_matches:
+        def score(profile: Dict[str, Any]) -> tuple[int, int]:
+            label = profile_display_label(profile)
+            name = str(profile.get("name") or "").strip()
+            pseudonym = str(profile.get("pseudonym") or "").strip()
+            return (int(bool(label)), int(bool(pseudonym or name)))
+
+        best = max(exact_wallet_matches, key=score)
+        label = profile_display_label(best)
+        if label:
+            return label
+
+    try:
+        activity_profile = fetch_wallet_profile_from_activity(session, wallet_key, timeout)
+    except Exception:
+        activity_profile = None
+    if activity_profile:
+        activity_label = profile_display_label(activity_profile)
+        if activity_label:
+            return activity_label
+    return None
+
+
+def derive_wallet_label(
+    session: requests.Session,
+    identifier: str,
+    wallet: str,
+    timeout: int,
+) -> str:
+    raw_identifier = str(identifier or "").strip()
+    wallet_key = normalize_wallet_address(wallet)
+
+    if raw_identifier and not is_wallet(raw_identifier):
+        candidate = sanitize_filename_component(raw_identifier, max_len=32)
+        return candidate or wallet_address_display(wallet_key)
+
+    profile_label = None
+    try:
+        profile_label = resolve_wallet_profile_label(session, wallet_key, timeout)
+    except Exception:
+        profile_label = None
+
+    if profile_label:
+        cleaned = sanitize_filename_component(profile_label, max_len=32)
+        if cleaned:
+            return cleaned
+
+    if raw_identifier:
+        if is_wallet(raw_identifier):
+            return wallet_address_display(wallet_key)
+        cleaned_identifier = sanitize_filename_component(raw_identifier, max_len=32)
+        if cleaned_identifier:
+            return cleaned_identifier
+    return wallet_address_display(wallet_key)
+
+
 def resolve_wallet(session: requests.Session, identifier: str, timeout: int) -> str:
     identifier = identifier.strip()
     if is_wallet(identifier):
         return identifier
 
-    url = urljoin(GAMMA_API, "public-search")
-    params = {
-        "q": identifier,
-        "search_profiles": "true",
-        "limit_per_type": 10,
-        "page": 1,
-    }
-    resp = session.get(url, params=params, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
-    profiles = payload.get("profiles") or []
+    profiles = fetch_public_search_profiles(session, identifier, timeout, limit_per_type=10)
     if not profiles:
         raise RuntimeError(f"No Polymarket profile matched {identifier!r}")
 
@@ -500,11 +635,12 @@ def resolve_wallet_identifiers(
         if wallet_key in seen_wallets:
             continue
         seen_wallets.add(wallet_key)
+        label = derive_wallet_label(session, identifier, wallet, timeout)
         resolved.append(
             {
                 "input": identifier,
                 "wallet": wallet,
-                "label": sanitize_filename_component(identifier, max_len=32),
+                "label": label,
             }
         )
     return resolved
@@ -591,6 +727,11 @@ def short_wallet_display(wallet: str) -> str:
     wallet_key = normalize_wallet_address(wallet)
     if len(wallet_key) >= 14:
         return wallet_key[:8] + "_" + wallet_key[-6:]
+    return wallet_key or "wallet"
+
+
+def wallet_address_display(wallet: str) -> str:
+    wallet_key = normalize_wallet_address(wallet)
     return wallet_key or "wallet"
 
 
@@ -1240,7 +1381,7 @@ def ensure_wallet_labels_root(state: Dict[str, Any]) -> Dict[str, str]:
         wallet = normalize_wallet_address(raw_wallet)
         if not wallet:
             continue
-        label = sanitize_filename_component(str(raw_label or ""), max_len=32)
+        label = sanitize_filename_component(str(raw_label or ""), max_len=64)
         cleaned[wallet] = label or wallet
     state[WALLET_LABELS_STATE_KEY] = cleaned
     return cleaned
@@ -1251,7 +1392,7 @@ def set_wallet_label(state: Dict[str, Any], wallet: str, label: str) -> None:
     if not wallet_key:
         return
     labels = ensure_wallet_labels_root(state)
-    cleaned = sanitize_filename_component(label, max_len=32)
+    cleaned = sanitize_filename_component(label, max_len=64)
     labels[wallet_key] = cleaned or wallet_key
 
 
@@ -1263,9 +1404,46 @@ def get_wallet_label(state: Dict[str, Any], wallet: str) -> str:
     existing = str(labels.get(wallet_key) or "").strip()
     if existing:
         return existing
-    default = wallet_key[:8] + "_" + wallet_key[-6:] if len(wallet_key) >= 14 else wallet_key
+    default = wallet_key
     labels[wallet_key] = default
     return default
+
+
+def wallet_label_is_placeholder(label: str, wallet: str) -> bool:
+    wallet_key = normalize_wallet_address(wallet)
+    current = normalize_for_match(label)
+    if current in {
+        normalize_for_match(wallet_key),
+        normalize_for_match(short_wallet_display(wallet_key)),
+    }:
+        return True
+
+    current_raw = str(label or "").strip().casefold()
+    if wallet_key and WALLET_HEX_FRAGMENT_RE.fullmatch(current_raw):
+        if wallet_key.startswith(current_raw) or current_raw.startswith(wallet_key):
+            return True
+    return False
+
+
+def refresh_wallet_label_from_profile_if_needed(
+    session: requests.Session,
+    state: Dict[str, Any],
+    wallet: str,
+    timeout: int,
+) -> None:
+    wallet_key = normalize_wallet_address(wallet)
+    if not wallet_key:
+        return
+    current = get_wallet_label(state, wallet_key)
+    if not wallet_label_is_placeholder(current, wallet_key):
+        return
+
+    try:
+        profile_label = resolve_wallet_profile_label(session, wallet_key, timeout)
+    except Exception:
+        profile_label = None
+    if profile_label:
+        set_wallet_label(state, wallet_key, profile_label)
 
 
 def migrate_legacy_processed_ids_if_needed(state: Dict[str, Any], wallet: str) -> None:
@@ -1341,7 +1519,9 @@ def collect_export_report_files(export_item: Dict[str, Any]) -> List[Path]:
 def export_item_wallet_name(export_item: Dict[str, Any]) -> str:
     wallet = normalize_wallet_address(export_item.get("wallet"))
     label = str(export_item.get("wallet_label") or "").strip()
-    return label or short_wallet_display(wallet)
+    if label and not wallet_label_is_placeholder(label, wallet):
+        return label
+    return wallet_address_display(wallet)
 
 
 def enrich_export_batch_wallet_labels(
@@ -1352,7 +1532,8 @@ def enrich_export_batch_wallet_labels(
     for export_item in exports_batch:
         enriched = dict(export_item)
         wallet = normalize_wallet_address(enriched.get("wallet"))
-        if wallet and not str(enriched.get("wallet_label") or "").strip():
+        existing_label = str(enriched.get("wallet_label") or "").strip()
+        if wallet and (not existing_label or wallet_label_is_placeholder(existing_label, wallet)):
             enriched["wallet_label"] = get_wallet_label(state, wallet)
         enriched_batch.append(enriched)
     return enriched_batch
@@ -1409,6 +1590,89 @@ def summarize_export_batch_wallets(exports_batch: Iterable[Dict[str, Any]]) -> D
     }
 
 
+def normalize_market_time_range_text(value: str) -> str:
+    text = " ".join(str(value or "").split()).upper()
+    text = re.sub(r"\s*-\s*", "-", text)
+    if text.endswith("ET"):
+        text = text[:-2].rstrip() + " ET"
+    return text
+
+
+def human_market_folder_label(title: str) -> str:
+    raw = " ".join(str(title or "").split()).strip()
+    if not raw:
+        return "market"
+
+    asset = raw
+    up_or_down_match = UP_OR_DOWN_TITLE_RE.match(raw)
+    if up_or_down_match:
+        asset = up_or_down_match.group("asset").strip()
+    elif " - " in raw:
+        asset = raw.split(" - ", 1)[0].strip()
+
+    time_match = MARKET_TIME_RANGE_RE.search(raw)
+    if time_match:
+        time_text = normalize_market_time_range_text(time_match.group(0))
+        return f"{asset} {time_text}".strip()
+    return raw
+
+
+def make_unique_folder_name(base_name: str, used_names: set[str], max_len: int) -> str:
+    root = sanitize_filename_component(base_name, max_len=max_len)
+    if not root:
+        root = "item"
+
+    candidate = root
+    index = 2
+    while candidate in used_names:
+        suffix = f" ({index})"
+        trimmed = root[: max(1, max_len - len(suffix))].rstrip(" .-")
+        candidate = f"{trimmed}{suffix}" if trimmed else f"item{suffix}"
+        index += 1
+
+    used_names.add(candidate)
+    return candidate
+
+
+def canonical_zip_report_filename(file_path: Path) -> str:
+    name_lower = file_path.name.lower()
+    if name_lower.endswith("_analysis.md"):
+        return "analysis.md"
+    if name_lower.endswith("_scenarios.csv"):
+        return "scenarios.csv"
+    if file_path.suffix.lower() == ".csv":
+        return "activity.csv"
+    if file_path.suffix.lower() == ".md":
+        return "notes.md"
+    return sanitize_filename_component(file_path.name, max_len=64)
+
+
+def make_unique_report_filename(file_name: str, used_names: set[str]) -> str:
+    candidate = str(file_name or "file")
+    stem = Path(candidate).stem or "file"
+    suffix = Path(candidate).suffix
+    index = 2
+    while candidate in used_names:
+        numbered_stem = sanitize_filename_component(
+            f"{stem}_{index}",
+            max_len=max(8, 64 - len(suffix)),
+        )
+        candidate = f"{numbered_stem}{suffix}"
+        index += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def export_item_wallet_group_key(export_item: Dict[str, Any], idx: int) -> str:
+    wallet = normalize_wallet_address(export_item.get("wallet"))
+    if wallet:
+        return f"wallet:{wallet}"
+    label = str(export_item.get("wallet_label") or "").strip()
+    if label:
+        return f"label:{normalize_for_match(label)}"
+    return f"entry:{idx}"
+
+
 def build_telegram_batch_zip(
     exports_batch: List[Dict[str, Any]],
     batch_start_index: int,
@@ -1418,50 +1682,99 @@ def build_telegram_batch_zip(
     batch_end_index = batch_start_index + len(exports_batch)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     wallet_summary = summarize_export_batch_wallets(exports_batch)
+
+    primary_market_hint = ""
+    if exports_batch:
+        primary_market_hint = sanitize_filename_component(
+            human_market_folder_label(str(exports_batch[0].get("title") or "market")),
+            max_len=34,
+        )
+
+    wallet_hint = sanitize_filename_component(
+        str(wallet_summary.get("caption_text") or wallet_summary.get("file_tag") or "wallets"),
+        max_len=40,
+    )
+    zip_base = " - ".join(
+        part for part in ["polymarket reports", wallet_hint, primary_market_hint] if part
+    )
     zip_name = (
-        "polymarket_reports_"
-        f"{wallet_summary['file_tag']}_{batch_start_index + 1:05d}-{batch_end_index:05d}_{timestamp}.zip"
+        f"{sanitize_filename_component(zip_base, max_len=120)}_"
+        f"{batch_start_index + 1:05d}-{batch_end_index:05d}_{timestamp}.zip"
     )
     zip_path = zip_directory / zip_name
 
     attached_count = 0
-    manifest_lines: List[str] = [
+    manifest_header_lines: List[str] = [
         f"created_utc={datetime.now(timezone.utc).isoformat()}",
         f"batch_start_index={batch_start_index}",
         f"batch_end_index={batch_end_index}",
         "",
     ]
 
+    wallet_folder_by_key: Dict[str, str] = {}
+    used_wallet_folder_names: set[str] = set()
+    used_market_folder_names: Dict[str, set[str]] = {}
+    wallet_mapping_lines: List[str] = []
+    entry_lines: List[str] = []
+
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for idx, export_item in enumerate(exports_batch, start=1):
             title = str(export_item.get("title") or "market").strip()
-            wallet = str(export_item.get("wallet") or "").strip().lower()
-            wallet_label = str(export_item.get("wallet_label") or "").strip()
-            safe_title = sanitize_filename_component(title, max_len=55)
-            safe_wallet = sanitize_filename_component(wallet_label or wallet or "wallet", max_len=24)
-            folder_name = f"{idx:02d}_{safe_wallet}_{safe_title}"
+            wallet = normalize_wallet_address(export_item.get("wallet"))
+            wallet_name = export_item_wallet_name(export_item)
+            wallet_key = export_item_wallet_group_key(export_item, idx)
+
+            wallet_folder = wallet_folder_by_key.get(wallet_key)
+            if wallet_folder is None:
+                wallet_folder = make_unique_folder_name(wallet_name, used_wallet_folder_names, max_len=48)
+                wallet_folder_by_key[wallet_key] = wallet_folder
+                wallet_mapping_lines.append(
+                    f"- {wallet_folder}: {wallet_name}"
+                    + (f" ({wallet})" if wallet else "")
+                )
+
+            market_root_names = used_market_folder_names.setdefault(wallet_folder, set())
+            market_folder = make_unique_folder_name(
+                human_market_folder_label(title),
+                market_root_names,
+                max_len=72,
+            )
+            folder_name = f"{wallet_folder}/{market_folder}"
+
             condition_id = str(export_item.get("condition_id") or "")
             market_id = str(export_item.get("market_id") or "")
 
-            manifest_lines.append(
+            entry_lines.append(
                 (
-                    f"[{idx}] wallet={wallet}"
-                    + (f" ({wallet_label})" if wallet_label else "")
-                    + f" | title={title} | condition_id={condition_id} | market_id={market_id}"
+                    f"[{idx}] wallet={wallet or '(unknown)'}"
+                    + f" ({wallet_name})"
+                    + f" | folder={folder_name} | title={title}"
+                    + f" | condition_id={condition_id} | market_id={market_id}"
                 )
             )
 
             files = collect_export_report_files(export_item)
             if not files:
-                manifest_lines.append("  files=none_found")
+                entry_lines.append("  files=none_found")
                 continue
 
+            used_report_names: set[str] = set()
             for file_path in files:
-                arcname = f"{folder_name}/{file_path.name}"
+                report_name = make_unique_report_filename(
+                    canonical_zip_report_filename(file_path),
+                    used_report_names,
+                )
+                arcname = f"{folder_name}/{report_name}"
                 zf.write(file_path, arcname=arcname)
                 attached_count += 1
-                manifest_lines.append(f"  file={file_path}")
+                entry_lines.append(f"  file={arcname} <= {file_path}")
 
+        manifest_lines = list(manifest_header_lines)
+        manifest_lines.append("wallet_folders:")
+        manifest_lines.extend(wallet_mapping_lines or ["- none"])
+        manifest_lines.append("")
+        manifest_lines.append("entries:")
+        manifest_lines.extend(entry_lines or ["none"])
         zf.writestr("manifest.txt", "\n".join(manifest_lines) + "\n")
 
     return zip_path, attached_count
@@ -1607,6 +1920,8 @@ def telegram_wallet_reply_markup() -> Dict[str, Any]:
 
 def wallet_selection_button_text(state: Dict[str, Any], wallet: str) -> str:
     label = get_wallet_label(state, wallet)
+    if wallet_label_is_placeholder(label, wallet):
+        return wallet_address_display(wallet)
     short_wallet = short_wallet_display(wallet)
     if normalize_for_match(label) == normalize_for_match(short_wallet):
         return short_wallet
@@ -2291,7 +2606,7 @@ def apply_wallet_control_command(
             return (False, f"Already tracking: {wallet_key}")
         targets.append(wallet_key)
         set_target_wallets(state, targets)
-        set_wallet_label(state, wallet_key, argument)
+        set_wallet_label(state, wallet_key, derive_wallet_label(session, argument, wallet_key, timeout))
         save_continuous_state(state_path, state)
         return (True, f"Added wallet: {wallet_key}")
 
@@ -2319,7 +2634,7 @@ def apply_wallet_control_command(
             resolved_pairs.append((identifier, normalize_wallet_address(resolved_wallet)))
 
         for identifier, wallet in resolved_pairs:
-            set_wallet_label(state, wallet, identifier)
+            set_wallet_label(state, wallet, derive_wallet_label(session, identifier, wallet, timeout))
         targets = set_target_wallets(state, [wallet for _, wallet in resolved_pairs])
         for tracked_wallet in list(ensure_selected_wallets_root(telegram_state).values()):
             if tracked_wallet not in targets:
@@ -2713,7 +3028,8 @@ def wallet_worker_loop(
             run_counter["exported"] = int(run_counter.get("exported", 0)) + 1
             exported_total = run_counter["exported"]
 
-        print(f"[{display}] wrote {count} rows to {output_path}")
+        summary_note = " (+1 SUMMARY row)" if count > 0 else ""
+        print(f"[{display}] wrote {count} activity rows{summary_note} to {output_path}")
         if analysis_result is not None:
             print(f"[{display}] wrote analysis report to {analysis_result['analysis_path']}")
             print(f"[{display}] wrote scenario table to {analysis_result['scenarios_path']}")
@@ -2795,6 +3111,9 @@ def run_continuous_collection(
             seen_targets.add(wallet)
             merged_targets.append(wallet)
         targets = set_target_wallets(state, merged_targets)
+
+        for wallet in targets:
+            refresh_wallet_label_from_profile_if_needed(session, state, wallet, timeout)
 
         if not targets and not (telegram_enabled and telegram_control_enabled):
             raise RuntimeError(
@@ -4158,14 +4477,61 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def build_csv_summary_row(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not rows:
+        return None
+
+    trade_rows = [row for row in rows if str(row.get("type") or "").upper() == "TRADE"]
+    redeem_rows = [row for row in rows if str(row.get("type") or "").upper() == "REDEEM"]
+
+    buy_rows = [row for row in trade_rows if str(row.get("side") or "").upper() == "BUY"]
+    sell_rows = [row for row in trade_rows if str(row.get("side") or "").upper() == "SELL"]
+
+    total_buy_spend = sum(parse_number(row.get("usdcSize")) for row in buy_rows)
+    total_sell_proceeds = sum(parse_number(row.get("usdcSize")) for row in sell_rows)
+    total_redeem = sum(parse_number(row.get("usdcSize")) for row in redeem_rows)
+
+    net_pnl = total_sell_proceeds + total_redeem - total_buy_spend
+    roi_pct = safe_div(net_pnl, total_buy_spend) * 100.0 if total_buy_spend > 0 else 0.0
+
+    leg_stats = compute_leg_stats(trade_rows)
+    winning_outcome = infer_winning_outcome(leg_stats, total_redeem)
+    winner_text = winning_outcome or "unknown"
+
+    return {
+        "datetime_utc": "",
+        "timestamp": "",
+        "type": "SUMMARY",
+        "side": winner_text,
+        "usdcSize": f"{net_pnl:.6f}",
+        "size": "",
+        "price": "",
+        "outcome": winner_text,
+        "outcomeIndex": "",
+        "title": (
+            "Realized summary | "
+            f"buy_spend={total_buy_spend:.6f} USDC | "
+            f"sell={total_sell_proceeds:.6f} USDC | "
+            f"redeem={total_redeem:.6f} USDC | "
+            f"net_pnl={net_pnl:.6f} USDC | "
+            f"roi={roi_pct:.4f}% | "
+            f"winner={winner_text}"
+        ),
+    }
+
+
 def write_csv(rows: Iterable[Dict[str, Any]], output_path: str) -> int:
-    normalized_rows = [normalize_row(r) for r in rows]
+    raw_rows = list(rows)
+    normalized_rows = [normalize_row(r) for r in raw_rows]
+    summary_row = build_csv_summary_row(raw_rows)
 
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         for row in normalized_rows:
             writer.writerow(row)
+        if summary_row is not None:
+            writer.writerow(summary_row)
 
     return len(normalized_rows)
 
@@ -4501,7 +4867,8 @@ def main() -> int:
             for title in suggestions:
                 print(f"  - {title}", file=sys.stderr)
 
-    print(f"Wrote {count} rows to {output_path}")
+    summary_note = " (+1 SUMMARY row)" if count > 0 else ""
+    print(f"Wrote {count} activity rows{summary_note} to {output_path}")
     if analysis_result is not None:
         print(f"Wrote analysis report to {analysis_result['analysis_path']}")
         print(f"Wrote scenario table to {analysis_result['scenarios_path']}")
